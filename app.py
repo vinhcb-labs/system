@@ -32,7 +32,7 @@ except Exception as e:
 
 # Header + logo (tuỳ chọn)
 logo_path = ROOT / "assets" / "logo.png"
-cols = st.columns([1, 6])
+cols = st.columns([1, 1])
 with cols[0]:
     if logo_path.exists():
         st.image(str(logo_path), use_column_width=True)
