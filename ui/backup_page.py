@@ -24,7 +24,7 @@ def _norm_win_path(raw: str) -> Path:
     Chuẩn hóa chuỗi đường dẫn Windows:
     - bỏ quote, expand %ENV% và ~
     - chấp nhận cả / và \ (đổi về \)
-    - (tùy chọn) thêm prefix \\?\ để hỗ trợ đường dẫn dài
+    - thêm prefix \\?\ để hỗ trợ đường dẫn dài (nếu có thể)
     """
     s = (raw or "").strip().strip('"').strip("'")
     if not s:
@@ -33,23 +33,23 @@ def _norm_win_path(raw: str) -> Path:
     s = os.path.expanduser(s)
     s = s.replace("/", "\\")
 
-    # Nếu là UNC: \\server\share\...
+    # UNC: \\server\share\...
     if _UNC_PATH.match(s):
-        long = r"\\?\UNC" + s[1:]           # \\?\UNC\server\share\...
+        long = "\\\\?\\UNC" + s[1:]          # -> \\?\UNC\server\share\...
         try:
             return Path(long)
         except Exception:
             return Path(s)
 
-    # Nếu dạng C:\... hoặc D:\...
+    # Drive: C:\..., D:\...
     if _DRIVE_PATH.match(s):
-        long = r"\\?\" + s                   # \\?\C:\...
+        long = "\\\\?\\" + s                 # -> \\?\C:\...
         try:
             return Path(long)
         except Exception:
             return Path(s)
 
-    # Trường hợp khác (tương đối): để nguyên (Path sẽ xử lý)
+    # Tương đối hoặc dạng khác
     return Path(s)
 
 # ---------- Page ----------
@@ -99,7 +99,7 @@ def render():
             src_path = _norm_win_path(src_raw)
             dst_dir  = _norm_win_path(dst_raw)
 
-            # Chuẩn hóa tuyệt đối (không dùng resolve để tránh đổi ký tự \/?)
+            # Kiểm tra tồn tại (không dùng resolve() để tránh biến đổi ký tự)
             if not src_path.exists() or not src_path.is_dir():
                 st.error(f"Thư mục nguồn không hợp lệ hoặc không tồn tại: `{src_raw}`")
                 return
@@ -120,15 +120,17 @@ def render():
                 st.warning("Thư mục nguồn không có file để nén.")
                 return
 
-            total_bytes = 0
+            # Thống kê
             try:
                 total_bytes = sum(f.stat().st_size for f in files)
+                size_str = _human_bytes(total_bytes)
             except Exception:
-                pass
+                total_bytes = 0
+                size_str = "—"
 
             m1, m2, m3 = st.columns(3)
             m1.metric("Số file", f"{len(files):,}")
-            m2.metric("Dung lượng ước tính", _human_bytes(total_bytes) if total_bytes else "—")
+            m2.metric("Dung lượng ước tính", size_str)
             m3.write(f"**Lưu thành:** `{zip_path}`")
 
             if show_preview:
@@ -138,10 +140,9 @@ def render():
                     if len(files) > 500:
                         st.caption(f"... và {len(files) - 500} file nữa")
 
+            # Nén với progress
             prog = st.progress(0)
             status = st.empty()
-
-            # Tạo ZIP (nếu Python không hỗ trợ compresslevel, fallback)
             try:
                 zf = ZipFile(zip_path, "w", compression=ZIP_DEFLATED, compresslevel=compress_level)
             except TypeError:
