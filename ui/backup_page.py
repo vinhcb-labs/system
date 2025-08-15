@@ -1,13 +1,12 @@
 # ui/backup_page.py
 from __future__ import annotations
 import os
-import re
 import time
 from pathlib import Path
 from zipfile import ZipFile, ZIP_DEFLATED
 import streamlit as st
 
-# ===== Helpers =====
+# ========= Helpers =========
 def _human_bytes(n: int) -> str:
     for unit in ["B", "KB", "MB", "GB", "TB"]:
         if n < 1024:
@@ -16,122 +15,110 @@ def _human_bytes(n: int) -> str:
     return f"{n:.2f} PB"
 
 def _collect_all_files(src: Path) -> list[Path]:
-    """Thu thập toàn bộ file trong thư mục (kể cả file ẩn)."""
     return [p for p in src.rglob("*") if p.is_file()]
 
-_WIN_DRIVE_RE = re.compile(r"^([A-Za-z]):[\\/](.*)$")
+def _pick_dir_dialog() -> str | None:
+    """Hộp thoại chọn thư mục (chạy LOCAL trên máy client)."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        path = filedialog.askdirectory()
+        root.destroy()
+        return path or None
+    except Exception:
+        return None
 
-def _normalize_path_for_server(raw: str) -> tuple[Path, str, bool]:
-    """
-    Chuẩn hoá đường dẫn người dùng nhập sang đường dẫn hợp lệ trên MÁY CHẠY APP.
-    Trả về: (path, hint, is_win_drive_input)
-    - Trên Windows: trả về Path(raw).
-    - Trên Linux/macOS: nếu nhập dạng 'E:\\something', thử quy đổi sang /mnt/e/something, /media/e/something.
-    """
-    hint = ""
-    if not raw:
-        return Path(""), hint, False
+def _rerun():
+    rr = getattr(st, "rerun", None)
+    if callable(rr):
+        rr()
+    else:
+        st.experimental_rerun()
 
-    s = raw.strip().strip('"').strip("'")
-    # Windows host
-    if os.name == "nt":
-        return Path(s).expanduser(), hint, False
-
-    # POSIX host (Linux/macOS)
-    m = _WIN_DRIVE_RE.match(s)
-    if m:
-        drv = m.group(1).lower()
-        rest = m.group(2).replace("\\", "/").lstrip("/")
-        candidates = [Path(f"/mnt/{drv}/{rest}"), Path(f"/media/{drv}/{rest}"), Path(f"/{drv}/{rest}")]
-        for cand in candidates:
-            if cand.exists():
-                hint = f"Đã quy đổi từ `{s}` → `{cand}`."
-                return cand, hint, True
-        # Không tìm thấy, vẫn trả về quy đổi mặc định để người dùng thấy đường dẫn mục tiêu
-        cand = Path(f"/mnt/{drv}/{rest}")
-        hint = f"Đã cố quy đổi `{s}` → `{cand}` nhưng không tìm thấy trên server."
-        return cand, hint, True
-
-    # POSIX path bình thường
-    return Path(s).expanduser(), hint, False
-
-# ===== Page =====
+# ========= Page =========
 def render():
-    st.subheader("1- Backup thư mục ➜ ZIP (nhập đường dẫn)")
+    st.subheader("1- Backup thư mục ➜ ZIP (máy bạn)")
 
-    st.markdown("**Thư mục nguồn**")
-    src_raw = st.text_input(
-        " ", key="bk_src",
-        placeholder=r"Ví dụ: C:\Data\project  hoặc  /home/user/data",
-        label_visibility="collapsed",
-    ).strip()
+    # State mặc định
+    st.session_state.setdefault("bk_src", "")
+    st.session_state.setdefault("bk_dst", "")
 
-    st.markdown("**Thư mục đích (nơi lưu file .zip)**")
-    dst_raw = st.text_input(
-        "  ", key="bk_dst",
-        placeholder=r"Ví dụ: C:\Backups  hoặc  /home/user/backups",
-        label_visibility="collapsed",
-    ).strip()
+    col1, col2 = st.columns([3, 2], gap="large")
 
-    # Chuẩn hoá & gợi ý
-    src_path, src_hint, src_windrive = _normalize_path_for_server(src_raw)
-    dst_path, dst_hint, dst_windrive = _normalize_path_for_server(dst_raw)
-    if src_hint:
-        st.caption(src_hint)
-    if dst_hint:
-        st.caption(dst_hint)
+    # ---- Chọn nguồn (nút trước, input sau) ----
+    with col1:
+        st.markdown("**Thư mục nguồn**")
+        choose_src = st.button("📁 Chọn nguồn")
+        if choose_src:
+            chosen = _pick_dir_dialog()
+            if chosen:
+                st.session_state["bk_src"] = chosen
+                _rerun()
+            else:
+                st.info("Bạn đã hủy hoặc không mở được hộp thoại. Có thể nhập đường dẫn thủ công.")
 
-    # Gợi ý tên zip
+        src_input = st.text_input(
+            " ", key="bk_src",
+            placeholder=r"VD: C:\Data\project  hoặc  /Users/you/data",
+            label_visibility="collapsed",
+        ).strip()
+
+    # ---- Chọn đích (nút trước, input sau) ----
+    with col2:
+        st.markdown("**Thư mục đích (lưu file .zip)**")
+        choose_dst = st.button("📁 Chọn đích")
+        if choose_dst:
+            chosen = _pick_dir_dialog()
+            if chosen:
+                st.session_state["bk_dst"] = chosen
+                _rerun()
+            else:
+                st.info("Bạn đã hủy hoặc không mở được hộp thoại. Có thể nhập đường dẫn thủ công.")
+
+        dst_input = st.text_input(
+            "  ", key="bk_dst",
+            placeholder=r"VD: C:\Backups  hoặc  /Users/you/Backups",
+            label_visibility="collapsed",
+        ).strip()
+
+    # Gợi ý tên file zip
     ts = time.strftime("%Y%m%d_%H%M%S")
-    default_name = f"{(src_path.name or 'backup')}_{ts}" if src_path else ""
+    default_name = f"{Path(src_input).name}_{ts}" if src_input else ""
     coln1, coln2 = st.columns([3, 2])
     with coln1:
         zip_name = st.text_input("Tên file ZIP (không cần .zip)", value=default_name)
     with coln2:
         compress_level = st.select_slider(
-            "Mức nén (ZIP_DEFLATED)", options=[1, 3, 5, 7, 9], value=5,
-            help="Mức nén cao hơn thì chậm hơn, nhưng file nhỏ hơn."
+            "Mức nén", options=[1, 3, 5, 7, 9], value=5,
+            help="Mức nén cao hơn → file nhỏ hơn nhưng chậm hơn."
         )
 
     st.divider()
     show_preview = st.checkbox("Xem trước danh sách file & dung lượng ước tính", value=True)
 
+    # --- Nén ---
     if st.button("🚀 Nén ngay", type="primary", use_container_width=True):
         try:
-            if not src_raw or not dst_raw:
-                st.error("Vui lòng nhập **thư mục nguồn** và **thư mục đích**.")
+            if not src_input or not dst_input:
+                st.error("Vui lòng chọn/nhập **thư mục nguồn** và **thư mục đích**.")
                 return
 
-            # Kiểm tra tồn tại thực tế
+            src_path = Path(src_input).expanduser().resolve()
+            dst_dir = Path(dst_input).expanduser().resolve()
+
             if not src_path.exists() or not src_path.is_dir():
-                # Thông báo thân thiện khi người dùng nhập đường dẫn Windows nhưng server là Linux/Cloud
-                if os.name != "nt" and _WIN_DRIVE_RE.match(src_raw):
-                    st.error(
-                        f"Thư mục nguồn không hợp lệ trên server: `{src_path}`.\n\n"
-                        "Bạn đã nhập đường dẫn **Windows** (vd. `E:\\...`) nhưng app đang chạy trên **Linux/Cloud**.\n"
-                        "Mình đã thử quy đổi sang dạng WSL (`/mnt/e/...`) nhưng không tìm thấy.\n\n"
-                        "**Cách xử lý:**\n"
-                        "• Chạy app trên chính máy Windows đó (localhost), hoặc\n"
-                        "• Mount thư mục Windows vào server (SMB/NFS/WSL), hoặc\n"
-                        "• Nén thư mục thành ZIP trên máy bạn rồi **upload** lên thư mục đích trên server."
-                    )
-                else:
-                    st.error(f"Thư mục nguồn không hợp lệ: `{src_path}`")
+                st.error(f"Thư mục nguồn không hợp lệ: `{src_path}`")
                 return
 
-            # Đích: tạo nếu hợp lệ (chỉ tạo được khi cha tồn tại / có quyền)
-            try:
-                dst_path.mkdir(parents=True, exist_ok=True)
-            except Exception as e:
-                st.error(f"Không tạo được thư mục đích: `{dst_path}`\nLý do: {e}")
-                return
+            dst_dir.mkdir(parents=True, exist_ok=True)
 
             base = (zip_name.strip() or f"{src_path.name}_{ts}")
             if not base.lower().endswith(".zip"):
                 base += ".zip"
-            zip_path = (dst_path / base)
+            zip_path = dst_dir / base
 
-            # Thu thập file
             files = _collect_all_files(src_path)
             if not files:
                 st.warning("Thư mục nguồn không có file để nén.")
@@ -153,7 +140,7 @@ def render():
             prog = st.progress(0)
             status = st.empty()
 
-            # Tạo ZIP (compresslevel có thể không hỗ trợ trên Python rất cũ)
+            # Tạo ZIP (compresslevel có thể không có ở Python rất cũ)
             try:
                 zf = ZipFile(zip_path, "w", compression=ZIP_DEFLATED, compresslevel=compress_level)
             except TypeError:
@@ -170,7 +157,7 @@ def render():
             status.write("✅ Hoàn tất nén.")
             st.success(f"Đã tạo: `{zip_path}`")
 
-            # Nút tải về (nếu client == server)
+            # Tải về (nếu bạn chạy app & trình duyệt trên cùng máy)
             try:
                 with open(zip_path, "rb") as fh:
                     st.download_button(
@@ -181,7 +168,7 @@ def render():
                 pass
 
             if os.name == "nt":
-                st.caption(f"Mẹo: dán đường dẫn sau vào Explorer để mở nhanh: `{dst_path}`")
+                st.caption(f"Mẹo: mở nhanh thư mục đích trên Explorer: `{dst_dir}`")
 
         except Exception as e:
             st.error(f"Đã xảy ra lỗi: {e}")
