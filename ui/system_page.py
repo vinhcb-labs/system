@@ -3,13 +3,7 @@ import streamlit as st
 from core.system_utils import get_system_info
 
 def render():
-    st.subheader("🖥️ System")
-    
-    if st.button("Lấy thông tin hệ thống"):
-        data = get_system_info()
-        df = pd.DataFrame([data]).T
-        df.columns = ["Giá trị"]
-        st.dataframe(df, use_container_width=True)
+   
 
     st.subheader("📦 Công cụ")
 
