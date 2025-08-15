@@ -31,7 +31,7 @@ except Exception as e:
 #st.title("VLabsTools – Streamlit")
 
 # Header + logo (tuỳ chọn)
-logo_path = ROOT / "assets" / ""
+logo_path = ROOT / "assets" / "logo.ico"
 cols = st.columns([1, 1])
 with cols[0]:
     if logo_path.exists():
