@@ -1,0 +1,5 @@
+Cài một lượt các thư viện
+& "C:\Dropbox\Apps\Python\.venv\Scripts\python.exe" -m pip install -r "C:\Dropbox\Apps\Python\Vlabstools_streamlit\requirements.txt"
+
+Chạy app:
+& "C:\Dropbox\Apps\Python\.venv\Scripts\python.exe" -m streamlit run "C:\Dropbox\Apps\Python\Vlabstools_streamlit\app.py" --server.headless true --server.port 8501
