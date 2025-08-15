@@ -46,5 +46,5 @@ PAGES = {
     "ℹ️ About":    about_page.render,
 }
 
-choice = st.sidebar.radio("Điều hướng", list(PAGES.keys()))
+choice = st.sidebar.radio(" ", list(PAGES.keys()))
 PAGES[choice]()
