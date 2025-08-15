@@ -2,9 +2,10 @@
 from __future__ import annotations
 import time
 import streamlit as st
+import streamlit.components.v1 as components
 from datetime import datetime
 from core.network_utils import (
-    get_public_ip, get_local_ips, ping_host, traceroute_host,
+    get_local_ips, ping_host, traceroute_host,
     check_ssl, dns_lookup, whois_query, port_scan
 )
 
@@ -13,6 +14,29 @@ def _ts() -> str:
 
 def _host_link(h: str) -> str:
     return f"<a href='http://{h}' target='_blank'>{h}</a>"
+
+def _client_public_ip_widget():
+    # Lấy Public IP của *trình duyệt* bằng JS (chạy trên client)
+    components.html(
+        """
+        <div style="font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
+                    background:#111827;color:#e5e7eb;padding:10px;border-radius:6px;">
+          <span id="clientip">Đang lấy IP từ trình duyệt...</span>
+        </div>
+        <script>
+        (async function(){
+          try{
+            const r = await fetch('https://api.ipify.org?format=json', {cache:'no-store'});
+            const j = await r.json();
+            document.getElementById('clientip').textContent = j.ip || 'Không xác định';
+          }catch(e){
+            document.getElementById('clientip').textContent = 'Lỗi lấy IP: ' + e;
+          }
+        })();
+        </script>
+        """,
+        height=60,
+    )
 
 def render():
     st.header("🌐 Network")
@@ -23,14 +47,13 @@ def render():
 
     # ---- View IP ----
     with tab1:
-        col1, col2 = st.columns(2)
-        with col1:
-            st.subheader("Public IP")
-            st.code(get_public_ip())
-        with col2:
-            st.subheader("Local IPs")
-            ips = get_local_ips()
-            st.code("\n".join(ips) if ips else "Không tìm thấy.")
+        st.subheader("Public IP (Thiết bị bạn đang dùng)")
+        _client_public_ip_widget()
+        st.caption("Lấy qua JavaScript trong trình duyệt (đúng với thiết bị của bạn).")
+
+        st.subheader("Local IPs (Server)")
+        ips = get_local_ips()
+        st.code("\n".join(ips) if ips else "Không tìm thấy.")
 
     # ---- Ping ----
     with tab2:
@@ -76,11 +99,11 @@ def render():
         if ok and domain.strip():
             st.code(whois_query(domain.strip()))
 
-    # ---- Port Scan (để trống = quét tất cả) ----
+    # ---- Port Scan (để trống = quét tất cả 1–65535) ----
     with tab7:
         with st.form("f_scan"):
             host = st.text_input("Host/IP", placeholder="vd: 8.8.8.8 hoặc example.com")
-            ports_str = st.text_input("Cổng (ví dụ: 22,80,443) — để trống sẽ quét **tất cả** 1–65535", value="")
+            ports_str = st.text_input("Cổng (ví dụ: 22,80,443) — để trống sẽ quét **1–65535**", value="")
             ok = st.form_submit_button("Scan")
         if ok and host.strip():
             ports = None
