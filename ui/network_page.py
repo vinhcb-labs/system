@@ -1,105 +1,102 @@
-import html
-import pandas as pd
+# ui/network_page.py
+from __future__ import annotations
+import time
 import streamlit as st
 from datetime import datetime
-
 from core.network_utils import (
-    get_public_ip, get_ip_local, get_dns_servers, ping_host,
-    dns_lookup, whois_lookup_verbose, check_ssl_expiry,
-    scan_open_ports, traceroute_host
+    get_public_ip, get_local_ips, ping_host, traceroute_host,
+    check_ssl, dns_lookup, whois_query, port_scan
 )
 
-# Map cổng -> dịch vụ (suy diễn từ network_utils.getservbyport nếu bạn muốn)
-from socket import getservbyport
-
-COMMON_MAP = {
-    "53":"DNS","80":"HTTP","443":"HTTPS","3389":"RDP","3306":"MySQL","5432":"PostgreSQL",
-    "6379":"Redis","8080":"HTTP Proxy","22":"SSH","25":"SMTP","110":"POP3","143":"IMAP",
-    "389":"LDAP","445":"SMB","853":"DNS over TLS","8000":"HTTP-alt","8081":"HTTP-alt"
-}
-
-def _service_for(p: str) -> str:
-    if p in COMMON_MAP: return COMMON_MAP[p]
-    try:  return getservbyport(int(p), "tcp").upper()
-    except: pass
-    try:  return getservbyport(int(p), "udp").upper()
-    except: return "Unknown"
-
-def _ts():
+def _ts() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-def _host_link(host: str) -> str:
-    url = host if host.lower().startswith(("http://","https://")) else f"http://{host}"
-    return f"[**{html.escape(host)}**]({html.escape(url)})"
+def _host_link(h: str) -> str:
+    return f"<a href='http://{h}' target='_blank'>{h}</a>"
 
 def render():
-    st.subheader("🌐 Network")
+    st.header("🌐 Network")
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-        "View IP", "Ping", "Check SSL", "Traceroute", "DNS", "WHOIS", "Port Scan"
-    ])
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+        ["View IP", "Ping", "Check SSL", "Traceroute", "DNS", "WHOIS", "Port Scan"]
+    )
 
+    # ---- View IP ----
     with tab1:
-        if st.button("Xem IP"):
-            st.markdown(f"<span style='color:#d00'>{_ts()}</span>", unsafe_allow_html=True)
-            st.code(f"[IP PUBLIC]: {get_public_ip()}\n[IP LOCAL]: {get_ip_local()}\n[DNS]: {get_dns_servers()}")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("Public IP")
+            st.code(get_public_ip())
+        with col2:
+            st.subheader("Local IPs")
+            ips = get_local_ips()
+            st.code("\n".join(ips) if ips else "Không tìm thấy.")
 
+    # ---- Ping ----
     with tab2:
         with st.form("f_ping"):
             host = st.text_input("Host/IP", placeholder="vd: 8.8.8.8 hoặc example.com")
             ok = st.form_submit_button("Ping")
-        if ok:
+        if ok and host.strip():
             st.markdown(f"<span style='color:#d00'>{_ts()}</span>  Ping {_host_link(host)}", unsafe_allow_html=True)
+            st.caption("Nếu môi trường không có lệnh `ping`, hệ thống sẽ dùng **TCP ping** (thử 443/80/53).")
             st.code(ping_host(host.strip()))
 
+    # ---- Check SSL ----
     with tab3:
         with st.form("f_ssl"):
-            domain = st.text_input("Domain", placeholder="vd: google.com")
-            ok = st.form_submit_button("Kiểm tra")
-        if ok:
-            st.markdown(f"<span style='color:#d00'>{_ts()}</span>  SSL {_host_link(domain)}", unsafe_allow_html=True)
-            st.code(check_ssl_expiry(domain.strip()))
+            host = st.text_input("Host", placeholder="example.com")
+            port = st.number_input("Port", min_value=1, max_value=65535, value=443, step=1)
+            ok = st.form_submit_button("Check SSL")
+        if ok and host.strip():
+            st.code(check_ssl(host.strip(), int(port)))
 
+    # ---- Traceroute ----
     with tab4:
-        with st.form("f_tr"):
-            host = st.text_input("Host/IP", placeholder="vd: 1.1.1.1 hoặc cloudflare.com")
+        with st.form("f_trace"):
+            host = st.text_input("Host/IP", placeholder="vd: 8.8.8.8 hoặc example.com")
             ok = st.form_submit_button("Traceroute")
-        if ok:
-            st.markdown(f"<span style='color:#d00'>{_ts()}</span>  Traceroute {_host_link(host)}", unsafe_allow_html=True)
+        if ok and host.strip():
+            st.caption("Tự phát hiện `tracert`/`traceroute`/`tracepath`. Nếu môi trường không hỗ trợ sẽ hiển thị thông báo.")
             st.code(traceroute_host(host.strip()))
 
+    # ---- DNS ----
     with tab5:
         with st.form("f_dns"):
-            host = st.text_input("Host/Domain", placeholder="vd: example.com")
-            ok = st.form_submit_button("Lookup")
-        if ok:
-            st.markdown(f"<span style='color:#d00'>{_ts()}</span>  DNS {_host_link(host)}", unsafe_allow_html=True)
+            host = st.text_input("Host/Domain", placeholder="example.com")
+            ok = st.form_submit_button("Tra DNS")
+        if ok and host.strip():
             st.code(dns_lookup(host.strip()))
 
+    # ---- WHOIS ----
     with tab6:
         with st.form("f_whois"):
-            domain = st.text_input("Domain", placeholder="vd: example.com")
+            domain = st.text_input("Domain", placeholder="example.com")
             ok = st.form_submit_button("WHOIS")
-        if ok:
-            st.markdown(f"<span style='color:#d00'>{_ts()}</span>  WHOIS {_host_link(domain)}", unsafe_allow_html=True)
-            st.code(whois_lookup_verbose(domain.strip()))
+        if ok and domain.strip():
+            st.code(whois_query(domain.strip()))
 
+    # ---- Port Scan (để trống = quét tất cả) ----
     with tab7:
-        with st.form("f_ps"):
-            host = st.text_input("Host/IP", placeholder="vd: 113.161.95.110 hoặc example.com")
+        with st.form("f_scan"):
+            host = st.text_input("Host/IP", placeholder="vd: 8.8.8.8 hoặc example.com")
+            ports_str = st.text_input("Cổng (ví dụ: 22,80,443) — để trống sẽ quét **tất cả** 1–65535", value="")
             ok = st.form_submit_button("Scan")
-        if ok:
-            st.markdown(f"<div style='color:#d00'>{_ts()}</div> {_host_link(host)}:", unsafe_allow_html=True)
-            raw = scan_open_ports(host.strip())
-            lines = [s.strip() for s in str(raw).splitlines() if s.strip()]
-            ports = [l.replace("Cổng mở: ", "") for l in lines]
+        if ok and host.strip():
+            ports = None
+            if ports_str.strip():
+                parts = [p.strip() for p in ports_str.split(",") if p.strip()]
+                ports = [int(p) for p in parts if p.isdigit() and 1 <= int(p) <= 65535]
 
-            if not ports:
-                st.info("Không có cổng mở.")
-            else:
-                df = pd.DataFrame(
-                    [{"Port": p, "Service": _service_for(p)} for p in ports],
-                    columns=["Port", "Service"]
-                )
-                st.dataframe(df, use_container_width=True, hide_index=True)
-                st.caption("Service được suy diễn từ map phổ biến + getservbyport(tcp/udp).")
+            st.info("Đang quét... Để trống sẽ quét **1–65535** (có thể mất thời gian).")
+            prog = st.progress(0)
+            start = time.perf_counter()
+
+            def cb(total, done):
+                prog.progress(int(done * 100 / total))
+
+            result = port_scan(host.strip(), ports=ports, progress_cb=cb)
+            prog.progress(100)
+            elapsed = time.perf_counter() - start
+            st.caption(f"Hoàn tất sau {elapsed:.1f}s")
+            st.code(result)
