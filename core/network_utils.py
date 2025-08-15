@@ -156,7 +156,6 @@ def get_preferred_ipv6() -> str | None:
 
     if not candidates:
         return None
-    # chọn ip có priority nhỏ nhất
     return sorted(candidates.items(), key=lambda kv: kv[1])[0][0]
 
 # --------- Ping / Traceroute ---------

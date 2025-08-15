@@ -52,7 +52,6 @@ def _client_ips_widget():
           const $ = (sel)=>document.querySelector(sel);
           const setText = (sel, v)=>{ const el = $(sel); if(el) el.textContent = (v ?? "").toString().trim() || "Không có"; };
           const isPrivateV4 = (ip)=>{
-            // RFC1918 & CGNAT
             return /^10\\./.test(ip) || /^192\\.168\\./.test(ip) ||
                    /^(172\\.(1[6-9]|2\\d|3[0-1])\\.)/.test(ip) ||
                    /^100\\.(6[4-9]|[7-9]\\d|1\\d\\d|2([0-1]\\d|2[0-7]))\\./.test(ip);
@@ -73,24 +72,20 @@ def _client_ips_widget():
           }
 
           async function resolveLocalV4(){
-            // Thử lấy IPv4 nội bộ qua WebRTC; nhiều trình duyệt hiện đại có thể chặn (mDNS).
             try{
               const pc = new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});
-              pc.createDataChannel('x');  // cần channel để sinh ICE
+              pc.createDataChannel('x');
               const cands = new Set();
               pc.onicecandidate = (e)=>{
                 if(!e.candidate) return;
                 const cand = e.candidate.candidate || "";
-                // cand ví dụ: "candidate:... typ host ... 192.168.1.5 ..."
                 const m = cand.match(/(?:\\s|:)(\\d+\\.\\d+\\.\\d+\\.\\d+)(?:\\s|:)/);
                 if(m && m[1] && isPrivateV4(m[1])) cands.add(m[1]);
               };
               const sdp = await pc.createOffer();
               await pc.setLocalDescription(sdp);
-              // chờ ICE trong thời gian ngắn
               await new Promise(r=>setTimeout(r, 800));
               pc.close();
-              // trả về 1 IP private nếu có
               const arr = Array.from(cands);
               return arr.length ? arr[0] : "";
             }catch(e){
@@ -115,23 +110,19 @@ def _client_ips_widget():
           }
 
           try{
-            // Lấy public v4/v6 song song và local v4
             const [pub4, pub6, local4] = await Promise.all([
               resolvePublicV4(), resolvePublicV6(), resolveLocalV4()
             ]);
 
-            // Public IP (Auto): ưu tiên IPv6, nếu rỗng dùng IPv4
             const auto = (pub6 && pub6.trim()) ? pub6 : (pub4 && pub4.trim()) ? pub4 : "Không có";
             setText("#ip_auto", auto);
 
-            // IPv4 Local (Client): nếu không lấy được, báo không thể lấy (do bảo mật)
             if(local4 && local4.trim()){
               setText("#ip_local_v4", local4);
             }else{
               setText("#ip_local_v4", "Không thể lấy (bị chặn bởi bảo mật trình duyệt)");
             }
 
-            // Public IPv6: nếu không có -> ẩn dòng
             if(pub6 && pub6.trim()){
               setText("#ipv6", pub6);
             }else{
@@ -139,7 +130,6 @@ def _client_ips_widget():
               if(row6) row6.style.display = "none";
             }
 
-            // Nút copy
             setupCopy("#copy_auto", "#ip_auto");
             setupCopy("#copy_local_v4", "#ip_local_v4");
             setupCopy("#copy6", "#ipv6");
@@ -155,11 +145,155 @@ def _client_ips_widget():
         height=170,
     )
 
+def _client_network_tools_widget():
+    # Bộ công cụ kiểm tra mạng chạy 100% trên trình duyệt (client-side)
+    components.html(
+        """
+<style>
+* { box-sizing: border-box; }
+.toolbox { background:#0b1220;color:#e5e7eb;border-radius:12px;padding:14px; font: 13px ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+.row { display:flex; gap:10px; align-items:center; margin:6px 0; flex-wrap:wrap; }
+input,select,button { padding:6px 8px; border:1px solid #334155; border-radius:8px; background:#111827; color:#e5e7eb; }
+button { cursor:pointer; }
+pre { background:#0f172a; padding:10px; border-radius:10px; overflow:auto; max-height:240px;}
+.badge { padding:2px 6px; border-radius:999px; border:1px solid #334155; }
+.small { opacity:0.7; }
+</style>
+
+<div class="toolbox">
+  <div class="row">
+    <div class="badge">CLIENT MODE</div>
+    <div class="small">Chạy hoàn toàn trên trình duyệt của bạn</div>
+  </div>
+
+  <h4>🔎 DNS (DoH – Cloudflare)</h4>
+  <div class="row">
+    <input id="d_host" placeholder="vd: example.com" style="min-width:260px">
+    <select id="d_type">
+      <option>A</option><option>AAAA</option><option>MX</option><option>NS</option><option>TXT</option><option>CNAME</option>
+    </select>
+    <button id="d_btn">Tra DNS</button>
+  </div>
+  <pre id="d_out">Kết quả sẽ hiển thị ở đây…</pre>
+
+  <h4>🌍 HTTP(S) Reachability / Pseudo-TCP</h4>
+  <div class="row">
+    <input id="h_host" placeholder="vd: example.com hoặc 8.8.8.8" style="min-width:260px">
+    <input id="h_port" type="number" min="1" max="65535" value="443" style="width:100px">
+    <select id="h_scheme"><option>https</option><option>http</option></select>
+    <button id="h_btn">Kiểm tra</button>
+  </div>
+  <div class="small">* Dùng mẹo &lt;img&gt; để thử thiết lập kết nối đến <code>scheme://host:port/</code>. Chỉ phát hiện được dịch vụ HTTP/HTTPS, không xác nhận TCP thuần.</div>
+  <pre id="h_out">Kết quả sẽ hiển thị ở đây…</pre>
+
+  <h4>⏱️ WebRTC Latency (STUN)</h4>
+  <div class="row">
+    <select id="w_stun">
+      <option>stun:stun.l.google.com:19302</option>
+      <option>stun:global.stun.twilio.com:3478</option>
+      <option>stun:stun.cloudflare.com:3478</option>
+    </select>
+    <button id="w_btn">Đo độ trễ</button>
+  </div>
+  <pre id="w_out">Kết quả sẽ hiển thị ở đây…</pre>
+</div>
+
+<script>
+const $ = (s)=>document.querySelector(s);
+const out = (el, msg)=>{ el.textContent = msg; };
+
+// --- DNS over HTTPS (Cloudflare JSON) ---
+async function dohQuery(name, type){
+  const url = `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(name)}&type=${encodeURIComponent(type)}`;
+  const res = await fetch(url, { headers: { "Accept":"application/dns-json" }, cache:"no-store" });
+  if(!res.ok) throw new Error("HTTP " + res.status);
+  return await res.json();
+}
+
+$("#d_btn")?.addEventListener("click", async ()=>{
+  const host = $("#d_host").value.trim();
+  const type = $("#d_type").value.trim() || "A";
+  const o = $("#d_out");
+  if(!host){ out(o, "Nhập domain trước."); return; }
+  out(o, "Đang tra DoH...");
+  try{
+    const j = await dohQuery(host, type);
+    out(o, JSON.stringify(j, null, 2));
+  }catch(e){
+    out(o, "Lỗi DoH: " + e);
+  }
+});
+
+// --- HTTP(S) reachability via <img> trick ---
+$("#h_btn")?.addEventListener("click", async ()=>{
+  const host = $("#h_host").value.trim();
+  const port = parseInt($("#h_port").value, 10);
+  const scheme = $("#h_scheme").value;
+  const o = $("#h_out");
+  if(!host || !port){ out(o, "Nhập host/port hợp lệ."); return; }
+
+  // Mixed Content: nếu trang đang chạy HTTPS, nạp HTTP có thể bị chặn.
+  const url = `${scheme}://${host}:${port}/favicon.ico?ts=${Date.now()}`;
+
+  out(o, `Đang thử tải: ${url}`);
+  const img = new Image();
+  const t0 = performance.now();
+  let finished = false;
+
+  const done = (ok, status)=>{
+    if(finished) return; finished = true;
+    const ms = (performance.now() - t0).toFixed(1);
+    out(o, (ok ? "✅ Kết nối thành công " : "❌ Không thể kết nối ") + `(${ms} ms)\\nGhi chú: ${status}`);
+  };
+
+  img.onload = ()=> done(true, "onload");
+  img.onerror = ()=> done(false, "onerror (bị chặn CORS, MixedContent, hoặc cổng không phục vụ HTTP)");
+  img.src = url;
+
+  setTimeout(()=>done(false, "timeout"), 6000);
+});
+
+// --- WebRTC latency to STUN (browser -> Internet) ---
+$("#w_btn")?.addEventListener("click", async ()=>{
+  const stun = $("#w_stun").value;
+  const o = $("#w_out");
+  out(o, "Đang đo...");
+  const t0 = performance.now();
+  try{
+    const pc = new RTCPeerConnection({ iceServers: [{ urls: stun }] });
+    pc.createDataChannel("x");
+    await pc.setLocalDescription(await pc.createOffer());
+
+    let got = false;
+    pc.onicecandidate = (e)=>{
+      if(e && e.candidate){
+        got = true;
+        const ms = (performance.now() - t0).toFixed(1);
+        out(o, `✅ ICE candidate sau ${ms} ms\\nCandidate: ${e.candidate.candidate}`);
+        pc.close();
+      }
+    };
+    setTimeout(()=>{
+      if(!got){
+        out(o, "❌ Không thu được ICE candidate (bị chặn WebRTC/STUN hoặc mạng hạn chế).");
+        pc.close();
+      }
+    }, 6000);
+  }catch(e){
+    out(o, "Lỗi WebRTC: " + e);
+  }
+});
+</script>
+        """,
+        height=700,
+    )
+
 def render():
     st.header("🌐 Network")
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
-        ["View IP", "Ping", "Check SSL", "Traceroute", "DNS", "WHOIS", "Port Scan"]
+    # Thêm tab "Client (Browser) Tests)" chạy hoàn toàn trên trình duyệt
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
+        ["View IP", "Ping", "Check SSL", "Traceroute", "DNS", "WHOIS", "Port Scan", "Client (Browser) Tests"]
     )
 
     # ---- View IP (Client) ----
@@ -168,7 +302,7 @@ def render():
         _client_ips_widget()
         st.caption("Public IP (Auto) ưu tiên IPv6 nếu có, nếu không sẽ dùng IPv4. IPv4 Local có thể không lấy được do bảo mật WebRTC của trình duyệt.")
 
-    # ---- Ping ----
+    # ---- Ping (server-side) ----
     with tab2:
         with st.form("f_ping"):
             host = st.text_input("Host/IP", placeholder="vd: 8.8.8.8 hoặc example.com")
@@ -178,7 +312,7 @@ def render():
             st.caption("Nếu môi trường không có lệnh `ping`, hệ thống sẽ dùng **TCP ping** (thử 443/80/53).")
             st.code(ping_host(host.strip()))
 
-    # ---- Check SSL ----
+    # ---- Check SSL (server-side) ----
     with tab3:
         with st.form("f_ssl"):
             host = st.text_input("Host", placeholder="example.com")
@@ -187,7 +321,7 @@ def render():
         if ok and host.strip():
             st.code(check_ssl(host.strip(), int(port)))
 
-    # ---- Traceroute ----
+    # ---- Traceroute (server-side) ----
     with tab4:
         with st.form("f_trace"):
             host = st.text_input("Host/IP", placeholder="vd: 8.8.8.8 hoặc example.com")
@@ -196,7 +330,7 @@ def render():
             st.caption("Tự phát hiện `tracert`/`traceroute`/`tracepath`. Nếu môi trường không hỗ trợ sẽ hiển thị thông báo.")
             st.code(traceroute_host(host.strip()))
 
-    # ---- DNS ----
+    # ---- DNS (server-side) ----
     with tab5:
         with st.form("f_dns"):
             host = st.text_input("Host/Domain", placeholder="example.com")
@@ -204,7 +338,7 @@ def render():
         if ok and host.strip():
             st.code(dns_lookup(host.strip()))
 
-    # ---- WHOIS ----
+    # ---- WHOIS (server-side) ----
     with tab6:
         with st.form("f_whois"):
             domain = st.text_input("Domain", placeholder="example.com")
@@ -212,7 +346,7 @@ def render():
         if ok and domain.strip():
             st.code(whois_query(domain.strip()))
 
-    # ---- Port Scan (để trống = quét tất cả 1–65535) ----
+    # ---- Port Scan (server-side) ----
     with tab7:
         with st.form("f_scan"):
             host = st.text_input("Host/IP", placeholder="vd: 8.8.8.8 hoặc example.com")
@@ -236,3 +370,9 @@ def render():
             elapsed = time.perf_counter() - start
             st.caption(f"Hoàn tất sau {elapsed:.1f}s")
             st.code(result)
+
+    # ---- Client-side tools (browser) ----
+    with tab8:
+        st.subheader("Kiểm tra mạng từ TRÌNH DUYỆT (client-side)")
+        st.caption("Các phép thử chạy 100% trên máy client. Hạn chế: không có ICMP, traceroute thật, và chỉ kiểm tra được cổng HTTP/HTTPS do giới hạn bảo mật trình duyệt.")
+        _client_network_tools_widget()
