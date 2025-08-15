@@ -31,7 +31,7 @@ def render():
 
     # Lời chào thư pháp
     st.markdown(
-        '<div class="calligraphy-title">Xin chào các ! 👋</div>',
+        '<div class="calligraphy-title">Xin chào các bạn! 👋</div>',
         unsafe_allow_html=True,
     )
 
