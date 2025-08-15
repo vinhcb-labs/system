@@ -5,7 +5,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 from datetime import datetime
 from core.network_utils import (
-    get_local_ips, ping_host, traceroute_host,
+    get_private_ips, ping_host, traceroute_host,
     check_ssl, dns_lookup, whois_query, port_scan
 )
 
@@ -16,7 +16,6 @@ def _host_link(h: str) -> str:
     return f"<a href='http://{h}' target='_blank'>{h}</a>"
 
 def _client_public_ip_widget():
-    # Lấy Public IP của *trình duyệt* bằng JS (chạy trên client)
     components.html(
         """
         <div style="font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
@@ -51,9 +50,18 @@ def render():
         _client_public_ip_widget()
         st.caption("Lấy qua JavaScript trong trình duyệt (đúng với thiết bị của bạn).")
 
-        st.subheader("Local IPs (Server)")
-        ips = get_local_ips()
-        st.code("\n".join(ips) if ips else "Không tìm thấy.")
+        st.subheader("IP nội bộ (Server) — ưu tiên IP tĩnh")
+        items = get_private_ips()
+        if items:
+            lines = []
+            for r in items:
+                tag = " (tĩnh)" if r.get("static") else ""
+                iface = f" [{r.get('iface')}]" if r.get("iface") else ""
+                lines.append(f"{r['ip']}{tag}{iface}")
+            st.code("\n".join(lines))
+            st.caption("Đánh dấu “(tĩnh)” khi xác định được DHCP=No (Windows). Nếu không xác định được, hiển thị tất cả IP private.")
+        else:
+            st.code("Không tìm thấy.")
 
     # ---- Ping ----
     with tab2:

@@ -1,6 +1,6 @@
 # core/network_utils.py
 from __future__ import annotations
-import socket, ssl, subprocess, sys, os, datetime, urllib.request, json, shutil, time
+import socket, ssl, subprocess, sys, os, urllib.request, json, shutil, time, ipaddress
 from typing import List, Tuple, Iterable, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -12,6 +12,12 @@ def _run_cmd(cmd: List[str], timeout: int = 60) -> str:
         return out.strip() if out else "Không có dữ liệu."
     except Exception as e:
         return f"Lỗi chạy lệnh: {e}"
+
+def _is_private_ipv4(ip: str) -> bool:
+    try:
+        return ipaddress.ip_address(ip).version == 4 and ipaddress.ip_address(ip).is_private
+    except Exception:
+        return False
 
 # ---- TCP ping fallback (khi không có lệnh ping/ICMP bị chặn) ----
 def _tcp_ping_once(host: str, port: int, timeout: float = 1.5) -> Tuple[bool, float | None]:
@@ -42,33 +48,73 @@ def _tcp_ping(host: str, attempts: int = 3) -> str:
 
 # --------- Public / Local IP ---------
 def get_public_ip() -> str:
-    try:
-        with urllib.request.urlopen("https://api.ipify.org?format=json", timeout=5) as r:
-            data = json.loads(r.read().decode("utf-8"))
-            return data.get("ip", "Không xác định")
-    except Exception as e:
-        return f"Lỗi lấy IP public: {e}"
+    sources = [
+        ("https://api.ipify.org?format=json", "json", "ip"),
+        ("https://ifconfig.co/json", "json", "ip"),
+        ("https://ident.me", "text", None),
+    ]
+    for url, kind, key in sources:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "vlabstools/1.0"})
+            with urllib.request.urlopen(req, timeout=5) as r:
+                raw = r.read().decode("utf-8", errors="ignore").strip()
+                if kind == "json":
+                    data = json.loads(raw)
+                    ip = data.get(key)
+                else:
+                    ip = raw
+                if ip:
+                    return ip
+        except Exception:
+            continue
+    return "Không lấy được (server không ra internet hoặc bị chặn)"
 
-def get_local_ips() -> List[str]:
-    ips = set()
-    try:
-        host = socket.gethostname()
-        for fam, _, _, _, sockaddr in socket.getaddrinfo(host, None):
-            ip = sockaddr[0]
-            if ":" not in ip and not ip.startswith("127."):
-                ips.add(ip)
-    except Exception:
-        pass
-    # psutil (nếu có) để bổ sung
+def get_private_ips() -> List[dict]:
+    """
+    Trả về danh sách IP nội bộ (private RFC1918) của *server*, ưu tiên IP tĩnh nếu xác định được.
+    Kết quả phần tử: {"ip": "192.168.1.10", "iface": "Ethernet", "static": True/False/None}
+    - Windows: cố gắng đọc 'netsh interface ipv4 show config' để phân biệt DHCP.
+    - Hệ khác: dùng psutil (nếu có) -> không chắc trạng thái tĩnh.
+    """
+    results: List[dict] = []
+
+    # --- Thử Windows: netsh để biết DHCP (static/tĩnh) ---
+    if os.name == "nt":
+        out = _run_cmd(["netsh", "interface", "ipv4", "show", "config"], timeout=10)
+        if "Configuration for interface" in out:
+            iface = None
+            static = None  # None/True/False
+            for line in out.splitlines():
+                s = line.strip()
+                if s.startswith("Configuration for interface"):
+                    # ví dụ: Configuration for interface "Ethernet"
+                    if '"' in s:
+                        iface = s.split('"', 2)[1]
+                    else:
+                        iface = s.rsplit(" ", 1)[-1]
+                    static = None
+                elif s.lower().startswith("dhcp enabled"):
+                    val = s.split(":", 1)[-1].strip().lower()
+                    static = (val == "no")
+                elif s.lower().startswith("ip address"):
+                    ip = s.split(":", 1)[-1].strip()
+                    if _is_private_ipv4(ip):
+                        results.append({"ip": ip, "iface": iface or "", "static": bool(static) if static is not None else None})
+
+    # --- Bổ sung qua psutil (nếu có) ---
     try:
         import psutil
-        for _, addrs in psutil.net_if_addrs().items():
+        for iface, addrs in psutil.net_if_addrs().items():
             for a in addrs:
-                if a.family == socket.AF_INET and not a.address.startswith("127."):
-                    ips.add(a.address)
+                if a.family == socket.AF_INET and _is_private_ipv4(a.address):
+                    if not any(r["ip"] == a.address for r in results):
+                        results.append({"ip": a.address, "iface": iface, "static": None})
     except Exception:
         pass
-    return sorted(ips)
+
+    # Sắp xếp: static True trước, còn lại theo iface/ip
+    results.sort(key=lambda r: (not bool(r.get("static")), str(r.get("iface") or ""), r["ip"]))
+    return results
 
 # --------- Ping / Traceroute ---------
 def ping_host(host: str) -> str:
@@ -78,7 +124,6 @@ def ping_host(host: str) -> str:
             return _run_cmd(["ping", "-n", "4", host])
         else:
             return _run_cmd(["ping", "-c", "4", host])
-    # Fallback TCP ping
     return _tcp_ping(host)
 
 def traceroute_host(host: str) -> str:
@@ -125,7 +170,6 @@ def dns_lookup(host: str) -> str:
     except Exception as e:
         lines.append(f"Lỗi DNS (socket): {e}")
 
-    # Nếu có dnspython thì xem thêm
     try:
         import dns.resolver
         for rtype in ["A", "AAAA", "MX", "NS", "TXT", "CNAME"]:
