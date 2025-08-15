@@ -5,7 +5,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 from datetime import datetime
 from core.network_utils import (
-    get_private_ipv4s, get_preferred_ipv6, ping_host, traceroute_host,
+    ping_host, traceroute_host,
     check_ssl, dns_lookup, whois_query, port_scan
 )
 
@@ -15,26 +15,144 @@ def _ts() -> str:
 def _host_link(h: str) -> str:
     return f"<a href='http://{h}' target='_blank'>{h}</a>"
 
-def _client_public_ip_widget():
+def _client_ips_widget():
+    """
+    Hiển thị:
+    - Public IP (Auto): ưu tiên IPv6, fallback IPv4 (IP ra mạng của thiết bị).
+    - IPv4 (Local - Client): IP nội bộ của thiết bị (thử lấy qua WebRTC; có thể bị trình duyệt chặn).
+    - Public IPv6 (Client): nếu không có thì ẩn dòng.
+    Tất cả có nút Copy.
+    """
     components.html(
         """
-        <div style="font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
-                    background:#111827;color:#e5e7eb;padding:10px;border-radius:6px;">
-          <span id="clientip">Đang lấy IP từ trình duyệt...</span>
+        <div id="ipbox" style="
+             font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
+             background:#111827;color:#e5e7eb;padding:12px 14px;border-radius:8px;line-height:1.6">
+          <!-- Public Auto -->
+          <div style="display:flex;gap:10px;align-items:center;justify-content:space-between;">
+            <div><b>Public IP (Auto):</b> <span id="ip_auto">Đang lấy...</span></div>
+            <button id="copy_auto" style="padding:4px 8px;border:1px solid #374151;border-radius:6px;
+                    background:#374151;color:#e5e7eb;cursor:pointer;">Copy</button>
+          </div>
+          <!-- IPv4 Local -->
+          <div style="display:flex;gap:10px;align-items:center;justify-content:space-between;margin-top:6px;">
+            <div><b>IPv4 (Local - Client):</b> <span id="ip_local_v4">Đang lấy...</span></div>
+            <button id="copy_local_v4" style="padding:4px 8px;border:1px solid #374151;border-radius:6px;
+                    background:#374151;color:#e5e7eb;cursor:pointer;">Copy</button>
+          </div>
+          <!-- Public IPv6 -->
+          <div id="row6" style="display:flex;gap:10px;align-items:center;justify-content:space-between;margin-top:6px;">
+            <div><b>Public IPv6 (Client):</b> <span id="ipv6">Đang lấy...</span></div>
+            <button id="copy6" style="padding:4px 8px;border:1px solid #374151;border-radius:6px;
+                    background:#374151;color:#e5e7eb;cursor:pointer;">Copy</button>
+          </div>
         </div>
         <script>
         (async function(){
+          const $ = (sel)=>document.querySelector(sel);
+          const setText = (sel, v)=>{ const el = $(sel); if(el) el.textContent = (v ?? "").toString().trim() || "Không có"; };
+          const isPrivateV4 = (ip)=>{
+            // RFC1918 & CGNAT
+            return /^10\\./.test(ip) || /^192\\.168\\./.test(ip) ||
+                   /^(172\\.(1[6-9]|2\\d|3[0-1])\\.)/.test(ip) ||
+                   /^100\\.(6[4-9]|[7-9]\\d|1\\d\\d|2([0-1]\\d|2[0-7]))\\./.test(ip);
+          };
+
+          async function getJSON(url){ const r = await fetch(url, {cache:'no-store'}); return await r.json(); }
+          async function getText(url){ const r = await fetch(url, {cache:'no-store'}); return (await r.text()).trim(); }
+
+          async function resolvePublicV4(){
+            try{ const j = await getJSON('https://api4.ipify.org?format=json'); if(j && j.ip) return j.ip; }catch(e){}
+            try{ const t = await getText('https://ipv4.icanhazip.com'); if(t) return t; }catch(e){}
+            return "";
+          }
+          async function resolvePublicV6(){
+            try{ const j = await getJSON('https://api6.ipify.org?format=json'); if(j && j.ip) return j.ip; }catch(e){}
+            try{ const t = await getText('https://ipv6.icanhazip.com'); if(t) return t; }catch(e){}
+            return "";
+          }
+
+          async function resolveLocalV4(){
+            // Thử lấy IPv4 nội bộ qua WebRTC; nhiều trình duyệt hiện đại có thể chặn (mDNS).
+            try{
+              const pc = new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});
+              pc.createDataChannel('x');  // cần channel để sinh ICE
+              const cands = new Set();
+              pc.onicecandidate = (e)=>{
+                if(!e.candidate) return;
+                const cand = e.candidate.candidate || "";
+                // cand ví dụ: "candidate:... typ host ... 192.168.1.5 ..."
+                const m = cand.match(/(?:\\s|:)(\\d+\\.\\d+\\.\\d+\\.\\d+)(?:\\s|:)/);
+                if(m && m[1] && isPrivateV4(m[1])) cands.add(m[1]);
+              };
+              const sdp = await pc.createOffer();
+              await pc.setLocalDescription(sdp);
+              // chờ ICE trong thời gian ngắn
+              await new Promise(r=>setTimeout(r, 800));
+              pc.close();
+              // trả về 1 IP private nếu có
+              const arr = Array.from(cands);
+              return arr.length ? arr[0] : "";
+            }catch(e){
+              return "";
+            }
+          }
+
+          function setupCopy(btnSel, valueSel){
+            const btn = $(btnSel);
+            btn?.addEventListener('click', async ()=>{
+              const ip = $(valueSel)?.textContent?.trim();
+              if(!ip || ip === "Không có"){ return; }
+              try{
+                await navigator.clipboard.writeText(ip);
+                const old = btn.textContent; btn.textContent = "Đã copy";
+                setTimeout(()=>btn.textContent = old, 1200);
+              }catch(e){
+                const old = btn.textContent; btn.textContent = "Lỗi copy";
+                setTimeout(()=>btn.textContent = old, 1200);
+              }
+            });
+          }
+
           try{
-            const r = await fetch('https://api.ipify.org?format=json', {cache:'no-store'});
-            const j = await r.json();
-            document.getElementById('clientip').textContent = j.ip || 'Không xác định';
+            // Lấy public v4/v6 song song và local v4
+            const [pub4, pub6, local4] = await Promise.all([
+              resolvePublicV4(), resolvePublicV6(), resolveLocalV4()
+            ]);
+
+            // Public IP (Auto): ưu tiên IPv6, nếu rỗng dùng IPv4
+            const auto = (pub6 && pub6.trim()) ? pub6 : (pub4 && pub4.trim()) ? pub4 : "Không có";
+            setText("#ip_auto", auto);
+
+            // IPv4 Local (Client): nếu không lấy được, báo không thể lấy (do bảo mật)
+            if(local4 && local4.trim()){
+              setText("#ip_local_v4", local4);
+            }else{
+              setText("#ip_local_v4", "Không thể lấy (bị chặn bởi bảo mật trình duyệt)");
+            }
+
+            // Public IPv6: nếu không có -> ẩn dòng
+            if(pub6 && pub6.trim()){
+              setText("#ipv6", pub6);
+            }else{
+              const row6 = document.getElementById("row6");
+              if(row6) row6.style.display = "none";
+            }
+
+            // Nút copy
+            setupCopy("#copy_auto", "#ip_auto");
+            setupCopy("#copy_local_v4", "#ip_local_v4");
+            setupCopy("#copy6", "#ipv6");
           }catch(e){
-            document.getElementById('clientip').textContent = 'Lỗi lấy IP: ' + e;
+            setText("#ip_auto", "Lỗi: " + e);
+            setText("#ip_local_v4", "Không thể lấy (bị chặn bởi bảo mật trình duyệt)");
+            const row6 = document.getElementById("row6");
+            if(row6) row6.style.display = "none";
           }
         })();
         </script>
         """,
-        height=60,
+        height=170,
     )
 
 def render():
@@ -44,19 +162,11 @@ def render():
         ["View IP", "Ping", "Check SSL", "Traceroute", "DNS", "WHOIS", "Port Scan"]
     )
 
-    # ---- View IP ----
+    # ---- View IP (Client) ----
     with tab1:
-        st.subheader("Public IP (Thiết bị bạn đang dùng)")
-        _client_public_ip_widget()
-        st.caption("Lấy qua JavaScript trong trình duyệt (đúng với thiết bị của bạn).")
-
-        st.subheader("IPv4 nội bộ (Server)")
-        v4s = get_private_ipv4s()
-        st.code("\n".join(v4s) if v4s else "Không có")
-
-        st.subheader("IPv6 (Server, nếu có)")
-        v6 = get_preferred_ipv6()
-        st.code(v6 if v6 else "Không có")
+        st.subheader("Địa chỉ IP của THIẾT BỊ đang dùng (Client)")
+        _client_ips_widget()
+        st.caption("Public IP (Auto) ưu tiên IPv6 nếu có, nếu không sẽ dùng IPv4. IPv4 Local có thể không lấy được do bảo mật WebRTC của trình duyệt.")
 
     # ---- Ping ----
     with tab2:
