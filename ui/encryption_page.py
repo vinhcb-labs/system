@@ -17,7 +17,7 @@ def render():
     colL, colR = st.columns([3, 2])
     with colL:
         length = st.slider("Password length", 8, 128, 16, 1)
-        count  = st.number_input("Quantity", min_value=1, max_value=50, value=5, step=1)
+        count  = st.number_input("Quantity", min_value=1, max_value=50, value=1, step=1)
         show_plain = st.checkbox("Show characters (unmasked)", value=False)
     with colR:
         st.markdown("**Character sets**")
