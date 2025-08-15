@@ -164,7 +164,7 @@ def render():
 
     # ---- View IP (Client) ----
     with tab1:
-        st.subheader("Địa chỉ IP của THIẾT BỊ đang dùng (Client)")
+        st.subheader("IP (Client)")
         _client_ips_widget()
         st.caption("Public IP (Auto) ưu tiên IPv6 nếu có, nếu không sẽ dùng IPv4. IPv4 Local có thể không lấy được do bảo mật WebRTC của trình duyệt.")
 
