@@ -1,175 +1,296 @@
 # ui/backup_page.py
 from __future__ import annotations
-import os, re, time
+import os
 from pathlib import Path
-from zipfile import ZipFile, ZIP_DEFLATED
+from datetime import datetime
 import streamlit as st
 
-# ---------- Helpers ----------
-_DRIVE_PATH = re.compile(r"^[A-Za-z]:\\")  # C:\..., D:\...
-_UNC_PATH   = re.compile(r"^\\\\")         # \\server\share\...
+# ===== Optional drivers (tự động phát hiện) =====
+try:
+    import pytds  # python-tds: không cần ODBC, hợp với Cloud
+    HAS_PYTDS = True
+except Exception:
+    HAS_PYTDS = False
 
-def _human_bytes(n: int) -> str:
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if n < 1024:
-            return f"{n:.2f} {unit}"
-        n /= 1024
-    return f"{n:.2f} PB"
+try:
+    import pyodbc  # dùng khi máy đã cài ODBC Driver 17/18
+    HAS_PYODBC = True
+except Exception:
+    HAS_PYODBC = False
 
-def _collect_all_files(src: Path) -> list[Path]:
-    return [p for p in src.rglob("*") if p.is_file()]
 
-def _norm_win_path(raw: str) -> Path:
+# ===== KẾT NỐI MSSQL =====
+def connect_mssql_with_pytds(server: str, port: int, database: str,
+                             username: str, password: str,
+                             encrypt: bool = True, validate_certificate: bool = False):
+    if not HAS_PYTDS:
+        raise RuntimeError("python-tds chưa được cài (requirements: python-tds).")
+    conn = pytds.connect(
+        server=server, port=port, database=database,
+        user=username, password=password,
+        autocommit=True, encrypt=encrypt, validate_certificate=validate_certificate,
+    )
+    return conn
+
+
+def connect_mssql_with_pyodbc(driver: str, server: str, database: str,
+                              username: str | None, password: str | None,
+                              trusted_connection: bool = False,
+                              encrypt: bool = True, trust_cert: bool = True):
+    if not HAS_PYODBC:
+        raise RuntimeError("pyodbc chưa được cài (requirements: pyodbc).")
+    parts = [
+        f"DRIVER={{{driver}}}",
+        f"SERVER={server}",
+        f"DATABASE={database}",
+    ]
+    if trusted_connection:
+        parts.append("Trusted_Connection=yes")
+    else:
+        parts.append(f"UID={username or ''}")
+        parts.append(f"PWD={password or ''}")
+    if encrypt:
+        parts.append("Encrypt=yes")
+    if trust_cert:
+        parts.append("TrustServerCertificate=yes")
+    conn_str = ";".join(parts)
+    return pyodbc.connect(conn_str, autocommit=True)
+
+
+# ===== TIỆN ÍCH =====
+def run_scalar(conn, sql: str, params: tuple | None = None):
+    cur = conn.cursor()
+    cur.execute(sql, params or ())
+    row = cur.fetchone()
+    cur.close()
+    return row[0] if row else None
+
+
+def list_databases(conn) -> list[str]:
+    # Bỏ 4 DB hệ thống cho gọn
+    sql = """
+    SELECT name
+    FROM sys.databases
+    WHERE database_id > 4
+    ORDER BY name;
     """
-    Chuẩn hóa chuỗi đường dẫn Windows:
-    - bỏ quote, expand %ENV% và ~
-    - chấp nhận cả / và \ (đổi về \)
-    - thêm prefix \\?\ để hỗ trợ đường dẫn dài (nếu có thể)
+    cur = conn.cursor()
+    cur.execute(sql)
+    rows = cur.fetchall()
+    cur.close()
+    return [r[0] for r in rows]
+
+
+def build_backup_tsql(dbname: str, disk_path: str, kind: str,
+                      use_compression: bool = True, use_checksum: bool = False) -> str:
     """
-    s = (raw or "").strip().strip('"').strip("'")
-    if not s:
-        return Path("")
-    s = os.path.expandvars(s)
-    s = os.path.expanduser(s)
-    s = s.replace("/", "\\")
+    Trả về câu lệnh BACKUP an toàn (escape tên DB & đường dẫn).
+    kind: 'FULL' | 'DIFFERENTIAL' | 'LOG'
+    """
+    # Escape: dùng QUOTENAME cho DB, và replace ' trong đường dẫn
+    db_quoted = f"[{dbname.replace(']', ']]')}]"
+    disk_escaped = disk_path.replace("'", "''")
 
-    # UNC: \\server\share\...
-    if _UNC_PATH.match(s):
-        long = "\\\\?\\UNC" + s[1:]          # -> \\?\UNC\server\share\...
-        try:
-            return Path(long)
-        except Exception:
-            return Path(s)
+    options = ["INIT", "STATS = 10"]
+    if use_compression:
+        options.append("COMPRESSION")
+    if use_checksum:
+        options.append("CHECKSUM")
 
-    # Drive: C:\..., D:\...
-    if _DRIVE_PATH.match(s):
-        long = "\\\\?\\" + s                 # -> \\?\C:\...
-        try:
-            return Path(long)
-        except Exception:
-            return Path(s)
-
-    # Tương đối hoặc dạng khác
-    return Path(s)
-
-# ---------- Page ----------
-def render():
-    st.subheader("1- Backup thư mục ➜ ZIP (Windows, nhập đường dẫn)")
-
-    if os.name != "nt":
-        st.error("Máy chạy app hiện **không phải Windows**. Trang này chỉ dùng khi chạy app trên Windows.")
-        return
-
-    st.markdown("**Thư mục nguồn (VD: `E:\\Data\\Project`)**")
-    src_raw = st.text_input(
-        " ", key="bk_src_manual",
-        placeholder=r"Ví dụ: C:\Data\Project  hoặc  E:\123",
-        label_visibility="collapsed",
-    ).strip()
-
-    st.markdown("**Thư mục đích (nơi lưu file .zip, VD: `E:\\Backups`)**")
-    dst_raw = st.text_input(
-        "  ", key="bk_dst_manual",
-        placeholder=r"Ví dụ: C:\Backups  hoặc  E:\Backups",
-        label_visibility="collapsed",
-    ).strip()
-
-    # Gợi ý tên file zip
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    default_name = f"{Path(src_raw).name}_{ts}" if src_raw else ""
-    c1, c2 = st.columns([3, 2])
-    with c1:
-        zip_name = st.text_input("Tên file ZIP (không cần .zip)", value=default_name, key="zip_name_manual")
-    with c2:
-        compress_level = st.select_slider(
-            "Mức nén (ZIP_DEFLATED)", options=[1, 3, 5, 7, 9], value=5,
-            help="Mức nén cao hơn → file nhỏ hơn nhưng nén chậm hơn."
+    if kind == "LOG":
+        return (
+            f"BACKUP LOG {db_quoted} "
+            f"TO DISK = N'{disk_escaped}' "
+            f"WITH {', '.join(options)};"
+        )
+    elif kind == "DIFFERENTIAL":
+        return (
+            f"BACKUP DATABASE {db_quoted} "
+            f"TO DISK = N'{disk_escaped}' "
+            f"WITH DIFFERENTIAL, {', '.join(options)};"
+        )
+    else:  # FULL
+        return (
+            f"BACKUP DATABASE {db_quoted} "
+            f"TO DISK = N'{disk_escaped}' "
+            f"WITH {', '.join(options)};"
         )
 
-    st.divider()
-    show_preview = st.checkbox("Xem trước danh sách file & dung lượng ước tính", value=True)
 
-    # Nén
-    if st.button("🚀 Nén ngay", type="primary", use_container_width=True):
+def do_backup(conn, dbname: str, dest_folder: str, filename: str,
+              kind: str, use_compression: bool, use_checksum: bool) -> tuple[bool, str]:
+    """
+    Thực thi backup, trả (ok, message)
+    Lưu ý: đường dẫn phải là THƯ MỤC TRÊN MÁY CHẠY SQL SERVER (dịch vụ SQL phải có quyền ghi).
+    """
+    # Ghép đường dẫn file .bak (trên máy SQL)
+    out = Path(dest_folder) / filename
+    tsql = build_backup_tsql(dbname, str(out), kind, use_compression, use_checksum)
+
+    cur = conn.cursor()
+    try:
+        cur.execute(tsql)
+        # Một số driver không trả message chi tiết; coi như OK nếu không ném lỗi.
+        return True, f"Tạo xong: {out}"
+    except Exception as e:
+        return False, f"Lỗi khi BACKUP: {e}"
+    finally:
         try:
-            if not src_raw or not dst_raw:
-                st.error("Vui lòng nhập **thư mục nguồn** và **thư mục đích**.")
-                return
+            cur.close()
+        except Exception:
+            pass
 
-            src_path = _norm_win_path(src_raw)
-            dst_dir  = _norm_win_path(dst_raw)
 
-            # Kiểm tra tồn tại (không dùng resolve() để tránh biến đổi ký tự)
-            if not src_path.exists() or not src_path.is_dir():
-                st.error(f"Thư mục nguồn không hợp lệ hoặc không tồn tại: `{src_raw}`")
-                return
+# ===== PAGE UI =====
+def render():
+    st.subheader("1- Backup SQL Server → .BAK")
 
-            try:
-                dst_dir.mkdir(parents=True, exist_ok=True)
-            except Exception as e:
-                st.error(f"Không tạo được thư mục đích: `{dst_raw}`\nLý do: {e}")
-                return
+    st.info(
+        "Backup chạy trực tiếp trên **Microsoft SQL Server**.\n\n"
+        "- **Đường dẫn đích** phải là thư mục **trên máy SQL Server** (dịch vụ SQL có quyền ghi).\n"
+        "- **Azure SQL Database** (không phải Managed Instance) **không hỗ trợ BACKUP/RESTORE .BAK**."
+    )
 
-            base = (zip_name.strip() or f"{src_path.name}_{ts}")
-            if not base.lower().endswith(".zip"):
-                base += ".zip"
-            zip_path = dst_dir / base
+    # ----------- Chọn driver & thông số kết nối -----------
+    drivers = []
+    if HAS_PYTDS:
+        drivers.append("MS SQL (python-tds) — khuyên dùng/Cloud")
+    if HAS_PYODBC:
+        drivers.append("MS SQL (pyodbc/ODBC) — Windows")
+    if not drivers:
+        st.error("Không tìm thấy driver kết nối. Cài `python-tds` (khuyên dùng) hoặc `pyodbc` rồi chạy lại.")
+        return
 
-            files = _collect_all_files(src_path)
-            if not files:
-                st.warning("Thư mục nguồn không có file để nén.")
-                return
+    backend = st.selectbox("Kết nối bằng", options=drivers, index=0)
 
-            # Thống kê
-            try:
-                total_bytes = sum(f.stat().st_size for f in files)
-                size_str = _human_bytes(total_bytes)
-            except Exception:
-                total_bytes = 0
-                size_str = "—"
+    with st.expander("Thiết lập kết nối", expanded=True):
+        col1, col2 = st.columns(2)
+        with col1:
+            server = st.text_input("Server / Host", value="localhost")
+            port = st.number_input("Port", min_value=1, max_value=65535, value=1433, step=1)
+            database_for_connect = st.text_input("Kết nối vào DB (nên để master)", value="master")
+        with col2:
+            if backend.startswith("MS SQL (pyodbc"):
+                driver_name = st.text_input("ODBC Driver", value="ODBC Driver 17 for SQL Server")
+                trusted = st.checkbox("Trusted_Connection", value=False)
+                username = st.text_input("Username", value="sa", disabled=trusted)
+                password = st.text_input("Password", value="", type="password", disabled=trusted)
+                encrypt = st.checkbox("Encrypt TLS", value=True)
+                trust_cert = st.checkbox("TrustServerCertificate", value=True)
+            else:
+                username = st.text_input("Username", value="sa")
+                password = st.text_input("Password", value="", type="password")
+                encrypt = st.checkbox("Encrypt TLS", value=True)
+                validate_cert = st.checkbox("Validate certificate", value=False)
 
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Số file", f"{len(files):,}")
-            m2.metric("Dung lượng ước tính", size_str)
-            m3.write(f"**Lưu thành:** `{zip_path}`")
+        btn_conn = st.button("🔌 Kết nối & lấy danh sách DB", use_container_width=True)
 
-            if show_preview:
-                with st.expander("📂 Xem danh sách file", expanded=False):
-                    for f in files[:500]:
-                        st.write(f"- {f.relative_to(src_path)}")
-                    if len(files) > 500:
-                        st.caption(f"... và {len(files) - 500} file nữa")
+    db_list = st.session_state.get("mssql_db_list", [])
+    if btn_conn:
+        try:
+            if backend.startswith("MS SQL (pyodbc"):
+                conn = connect_mssql_with_pyodbc(
+                    driver=driver_name, server=f"{server},{port}",
+                    database=database_for_connect,
+                    username=None if trusted else username,
+                    password=None if trusted else password,
+                    trusted_connection=trusted, encrypt=encrypt, trust_cert=trust_cert
+                )
+            else:
+                conn = connect_mssql_with_pytds(
+                    server=server, port=int(port), database=database_for_connect,
+                    username=username, password=password,
+                    encrypt=encrypt, validate_certificate=validate_cert
+                )
+            with conn:
+                db_list = list_databases(conn)
+            st.session_state["mssql_conn_params"] = {
+                "backend": backend, "server": server, "port": int(port),
+                "database": database_for_connect, "username": username, "password": password,
+                "encrypt": encrypt,
+                "trusted": (trusted if backend.startswith("MS SQL (pyodbc") else False),
+                "driver_name": (driver_name if backend.startswith("MS SQL (pyodbc") else None),
+                "trust_cert": (trust_cert if backend.startswith("MS SQL (pyodbc") else None),
+                "validate_cert": (validate_cert if not backend.startswith("MS SQL (pyodbc") else None),
+            }
+            st.session_state["mssql_db_list"] = db_list
+            if not db_list:
+                st.warning("Kết nối OK nhưng không thấy DB user (có thể chỉ có DB hệ thống).")
+            else:
+                st.success(f"Kết nối OK. Tìm thấy {len(db_list)} DB.")
+        except Exception as e:
+            st.error(f"Không kết nối được: {e}")
 
-            # Nén với progress
-            prog = st.progress(0)
-            status = st.empty()
-            try:
-                zf = ZipFile(zip_path, "w", compression=ZIP_DEFLATED, compresslevel=compress_level)
-            except TypeError:
-                zf = ZipFile(zip_path, "w", compression=ZIP_DEFLATED)
+    # ----------- Chọn DB & tuỳ chọn backup -----------
+    st.markdown("### Thiết lập backup")
+    if db_list:
+        dbname = st.selectbox("Chọn database", options=db_list)
+    else:
+        dbname = st.text_input("Tên database", value="YourDatabase")
 
-            with zf as z:
-                for i, f in enumerate(files, start=1):
-                    z.write(f, f.relative_to(src_path))
-                    if i % 20 == 0 or i == len(files):
-                        prog.progress(int(i * 100 / len(files)))
-                        status.write(f"Đang nén: `{f.relative_to(src_path)}` ({i}/{len(files)})")
+    colA, colB = st.columns(2)
+    with colA:
+        kind = st.selectbox("Loại backup", options=["FULL", "DIFFERENTIAL", "LOG"], index=0)
+        use_compression = st.checkbox("COMPRESSION", value=True)
+        use_checksum = st.checkbox("CHECKSUM", value=False)
+    with colB:
+        dest_folder = st.text_input(
+            "Thư mục đích trên MÁY SQL (ví dụ Windows: D:\\SQLBackups | Linux: /var/opt/mssql/backups)",
+            value=r"D:\SQLBackups" if os.name == "nt" else "/var/opt/mssql/backups"
+        )
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = f"{dbname}_{kind}_{ts}.bak" if dbname else f"backup_{ts}.bak"
+        filename = st.text_input("Tên file .bak", value=default_name)
 
-            prog.progress(100)
-            status.write("✅ Hoàn tất nén.")
-            st.success(f"Đã tạo: `{zip_path}`")
+    run_backup = st.button("🗂️ Backup ngay", type="primary", use_container_width=True)
 
-            # Cho tải về (nếu bạn chạy app & trình duyệt trên cùng máy)
-            try:
-                with open(zip_path, "rb") as fh:
-                    st.download_button(
-                        "📥 Tải file ZIP", fh, file_name=zip_path.name,
-                        mime="application/zip", use_container_width=True
+    if run_backup:
+        # Lấy lại tham số kết nối đã test
+        params = st.session_state.get("mssql_conn_params")
+        if not params:
+            st.warning("Bạn chưa 'Kết nối & lấy danh sách DB'. Mình sẽ cố gắng kết nối bằng tham số hiện tại.")
+            params = {
+                "backend": backend, "server": server, "port": int(port),
+                "database": database_for_connect, "username": username, "password": password,
+                "encrypt": encrypt,
+                "trusted": (trusted if backend.startswith("MS SQL (pyodbc") else False),
+                "driver_name": (driver_name if backend.startswith("MS SQL (pyodbc") else None),
+                "trust_cert": (trust_cert if backend.startswith("MS SQL (pyodbc") else None),
+                "validate_cert": (validate_cert if not backend.startswith("MS SQL (pyodbc") else None),
+            }
+
+        try:
+            # Kết nối tới DB đích (dùng 'master' cũng được vì BACKUP chấp nhận tên DB khác)
+            if params["backend"].startswith("MS SQL (pyodbc"):
+                conn = connect_mssql_with_pyodbc(
+                    driver=params["driver_name"], server=f'{params["server"]},{params["port"]}',
+                    database=params["database"],
+                    username=None if params["trusted"] else params["username"],
+                    password=None if params["trusted"] else params["password"],
+                    trusted_connection=params["trusted"],
+                    encrypt=params["encrypt"],
+                    trust_cert=params["trust_cert"],
+                )
+            else:
+                conn = connect_mssql_with_pytds(
+                    server=params["server"], port=int(params["port"]), database=params["database"],
+                    username=params["username"], password=params["password"],
+                    encrypt=params["encrypt"], validate_certificate=bool(params["validate_cert"])
+                )
+
+            with st.spinner("Đang thực hiện BACKUP…"):
+                with conn:
+                    ok, msg = do_backup(
+                        conn=conn, dbname=dbname, dest_folder=dest_folder,
+                        filename=filename, kind=kind,
+                        use_compression=use_compression, use_checksum=use_checksum
                     )
-            except Exception:
-                pass
-
-            st.caption(f"Mở nhanh thư mục đích: `{dst_dir}`")
+            if ok:
+                st.success(f"✅ {msg}")
+                st.caption("Lưu ý: file .bak nằm **trên máy chạy SQL Server**. "
+                           "Nếu SQL Server ở máy khác, hãy copy về máy bạn sau.")
+            else:
+                st.error(msg)
 
         except Exception as e:
-            st.error(f"Đã xảy ra lỗi: {e}")
+            st.error(f"Lỗi kết nối/thi hành: {e}")

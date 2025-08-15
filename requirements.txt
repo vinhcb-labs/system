@@ -3,3 +3,7 @@ pandas
 psutil
 dnspython
 python-whois
+pyodbc
+streamlit>=1.36
+python-tds>=1.15.0
+
