@@ -5,7 +5,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 from datetime import datetime
 from core.network_utils import (
-    get_private_ips, ping_host, traceroute_host,
+    get_private_ipv4s, get_preferred_ipv6, ping_host, traceroute_host,
     check_ssl, dns_lookup, whois_query, port_scan
 )
 
@@ -50,18 +50,13 @@ def render():
         _client_public_ip_widget()
         st.caption("Lấy qua JavaScript trong trình duyệt (đúng với thiết bị của bạn).")
 
-        st.subheader("IP nội bộ (Server) — ưu tiên IP tĩnh")
-        items = get_private_ips()
-        if items:
-            lines = []
-            for r in items:
-                tag = " (tĩnh)" if r.get("static") else ""
-                iface = f" [{r.get('iface')}]" if r.get("iface") else ""
-                lines.append(f"{r['ip']}{tag}{iface}")
-            st.code("\n".join(lines))
-            st.caption("Đánh dấu “(tĩnh)” khi xác định được DHCP=No (Windows). Nếu không xác định được, hiển thị tất cả IP private.")
-        else:
-            st.code("Không tìm thấy.")
+        st.subheader("IPv4 nội bộ (Server)")
+        v4s = get_private_ipv4s()
+        st.code("\n".join(v4s) if v4s else "Không có")
+
+        st.subheader("IPv6 (Server, nếu có)")
+        v6 = get_preferred_ipv6()
+        st.code(v6 if v6 else "Không có")
 
     # ---- Ping ----
     with tab2:
