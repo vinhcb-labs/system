@@ -3,7 +3,7 @@ from pathlib import Path
 import sys
 import os
 # Imports
-from ui import mainwindow_page, network_page, system_page, backup_page, about_page, encryption_page
+from ui import mainwindow_page, network_page, system_page, backup_page, about_page, encryption_page, soft_page
 
 # ==== Paths & sys.path ====
 ROOT = Path(__file__).resolve().parent
@@ -43,7 +43,8 @@ with cols[1]:
 PAGES = {
     "🏠 Home":     mainwindow_page.render,
     "🌐 Network":  network_page.render,
-    "🖥️ System":   system_page.render,
+    "📀 Software": soft_page.render,
+    #"🖥️ System":   system_page.render,
     "🗂️ Backup":   backup_page.render,
     "🔐 Encryption": encryption_page.render,
     "ℹ️ About":    about_page.render,

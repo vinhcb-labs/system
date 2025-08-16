@@ -240,7 +240,7 @@ def whois_query(domain: str) -> str:
             parts.append(f"{k}: {v}")
         return "\n".join(parts)
     except Exception as e:
-        return f"Lỗi WHOIS (cần package 'python-whois'): {e}"
+        return f"Erro WHOIS (setup package 'python-whois'): {e}"
 
 # --------- Port scan ---------
 def _probe_port(host: str, port: int, timeout: float) -> tuple[int, bool]:
@@ -283,7 +283,7 @@ def port_scan(
 
         open_ports.sort()
         if open_ports:
-            return "OPEN:\n" + "\n".join(f"{p}/tcp OPEN" for p in open_ports)
-        return "Không phát hiện cổng mở."
+            return "Open port detected:\n" + "\n".join(f"{p}/tcp OPEN" for p in open_ports)
+        return "No open ports detected."
     except Exception as e:
         return f"Lỗi scan: {e}"

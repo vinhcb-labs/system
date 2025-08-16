@@ -90,9 +90,10 @@ def _client_ips_widget() -> None:
 
 # ---------------- Page ----------------
 def render() -> None:
-   
+    #st.title("Network")
+    #st.caption(" ")
 
-    # Tabs: View IP, Check SSL, DNS, WHOIS, Port Scan
+    # Create tabs up-front so tab variables exist
     tab1, tab2, tab3, tab4, tab5 = st.tabs(
         ["View IP", "Check SSL", "DNS", "WHOIS", "Port Scan"]
     )
@@ -107,7 +108,7 @@ def render() -> None:
         with st.form("f_ssl"):
             host = st.text_input("Host/Domain", placeholder="example.com")
             port = st.number_input("Port", min_value=1, max_value=65535, value=443, step=1)
-            ok = st.form_submit_button("Check SSL")
+            ok = st.form_submit_button("Search")
         if ok and host.strip():
             st.code(check_ssl(host.strip(), int(port)))
 
@@ -115,7 +116,7 @@ def render() -> None:
     with tab3:
         with st.form("f_dns"):
             host = st.text_input("Host/Domain", placeholder="example.com")
-            ok = st.form_submit_button("Tra DNS")
+            ok = st.form_submit_button("Search")
         if ok and host.strip():
             st.code(dns_lookup(host.strip()))
 
@@ -123,17 +124,21 @@ def render() -> None:
     with tab4:
         with st.form("f_whois"):
             domain = st.text_input("Domain", placeholder="example.com")
-            ok = st.form_submit_button("Tra WHOIS")
+            ok = st.form_submit_button("Search")
         if ok and domain.strip():
             st.code(whois_query(domain.strip()))
 
     # ---- Port Scan ----
     with tab5:
         def _parse_ports(s: str) -> List[int]:
-            """Parse '22,80,443' and ranges like '1-1024' into a list of ints."""
+            """Parse '22,80,443' and ranges like '1-1024' into a list of ints.
+            If s is empty -> return full range 1..65535
+            """
             s = (s or "").strip()
             if not s:
-                return []
+                # Full scan
+                return list(range(1, 65536))
+
             out: List[int] = []
             for part in s.split(","):
                 part = part.strip()
@@ -145,35 +150,41 @@ def render() -> None:
                         a, b = int(a), int(b)
                         if a > b:
                             a, b = b, a
-                        out.extend(range(a, b + 1))
-                    except:
+                        out.extend(range(max(1, a), min(65535, b) + 1))
+                    except Exception:
                         pass
                 else:
                     try:
-                        out.append(int(part))
-                    except:
+                        x = int(part)
+                        if 1 <= x <= 65535:
+                            out.append(x)
+                    except Exception:
                         pass
-            # unique & valid
-            out = sorted({p for p in out if 1 <= p <= 65535})
-            return out
+            # unique & sorted
+            return sorted(set(out))
 
         with st.form("f_scan"):
-            host = st.text_input("Host/IP", placeholder="example.com hoặc 8.8.8.8")
-            ports_str = st.text_input("Ports (ví dụ: 22,80,443 hoặc 1-1024)", value="80,443,22")
-            ok = st.form_submit_button("Quét cổng")
-        if ok and host.strip():
-            ports = _parse_ports(ports_str)
-            if not ports:
-                st.warning("Vui lòng nhập danh sách cổng hợp lệ.")
+            host = st.text_input("Host/IP", placeholder="example.com")
+            ports_str = st.text_input("Ports",
+                                      placeholder="If It's empty -> return full range 1..65535")
+            ok = st.form_submit_button("Search")
+        if ok:
+            if not host.strip():
+                st.warning("Vui lòng nhập Host/IP.")
             else:
+                ports = _parse_ports(ports_str)
+
+                # Progress bar
                 pbar = st.progress(0)
-                total_cache = {"total": 1}  # will be updated by callback
+                total_cache = {"total": max(len(ports), 1)}
 
                 def _cb(total: int, done: int) -> None:
+                    # network_utils.port_scan sẽ gọi callback với total & done
                     total_cache["total"] = max(total, 1)
                     p = int(done * 100 / total_cache["total"])
                     pbar.progress(min(max(p, 0), 100))
 
+                # Thực hiện quét
                 result = port_scan(host.strip(), ports=ports, progress_cb=_cb)
                 pbar.progress(100)
                 st.code(result)
