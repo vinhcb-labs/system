@@ -1,184 +1,156 @@
 # ui/backup_page.py
 from __future__ import annotations
-
 import os
-from pathlib import Path
-from datetime import datetime
-from typing import List, Optional
-
 import streamlit as st
-from core import backup_utils  # uses mssql_* and zip_folder helpers
+from typing import Any, Callable, Dict
+from core import backup_utils
+
+
+# ---------------- Helper ----------------
+def _safe_call(func: Callable, **kwargs) -> Any:
+    """Gọi hàm backup_utils với tên tham số có thể khác nhau."""
+    import inspect
+    sig = inspect.signature(func)
+    mapped = {}
+    for name in sig.parameters.keys():
+        if name in kwargs:
+            mapped[name] = kwargs[name]
+        else:
+            # map alias
+            if name in ("src_dir", "src"): mapped[name] = kwargs.get("src") or kwargs.get("src_dir")
+            if name in ("dst_dir", "dst"): mapped[name] = kwargs.get("dst") or kwargs.get("dst_dir")
+            if name in ("excludes", "exclude_globs"): mapped[name] = kwargs.get("excludes") or kwargs.get("exclude_globs")
+            if name in ("progress_callback", "progress_cb"): mapped[name] = kwargs.get("progress_callback") or kwargs.get("progress_cb")
+            if name in ("server", "server_instance"): mapped[name] = kwargs.get("server") or kwargs.get("server_instance")
+            if name in ("database", "db"): mapped[name] = kwargs.get("database") or kwargs.get("db")
+            if name in ("dest_path", "dst"): mapped[name] = kwargs.get("dest_path") or kwargs.get("dst")
+    return func(**mapped)
+
 
 # ---------------- Page ----------------
 def render() -> None:
-    st.title("🔐 Backup Tools")
+    st.title("Backup Tools")
+    st.caption("Chọn loại backup bạn muốn thực hiện")
 
-    tab_sql, tab_folder = st.tabs(["BackupSQL", "Backup Folder..."])
-
-    with tab_sql:
-        _tab_backup_sql()
-
-    with tab_folder:
-        _tab_backup_folder()
+    tabs = st.tabs(["BackupSQL", "Backup Folder..."])
+    with tabs[0]:
+        backup_sql_tab()
+    with tabs[1]:
+        backup_folder_tab()
 
 
-# ---------------- Tab: Backup SQL ----------------
-def _tab_backup_sql() -> None:
-    st.subheader("Backup SQL Server (.bak)")
+# ---------------- Backup Folder ----------------
+def backup_folder_tab() -> None:
+    st.subheader("Backup Folder → ZIP")
 
-    with st.form("sql_conn_form", clear_on_submit=False):
-        cols = st.columns(3)
-        with cols[0]:
-            driver = st.text_input("Driver", value="ODBC Driver 17 for SQL Server", key="sql_driver")
-        with cols[1]:
-            server = st.text_input("Server / Instance", value="localhost", key="sql_server_instance")
-        with cols[2]:
-            port = st.text_input("Port (tuỳ chọn, mặc định 1433)", value="", key="sql_port")
+    src = st.text_input("Thư mục nguồn", key="bf_src")
+    dst = st.text_input("File ZIP đích", value=os.path.join(os.getcwd(), "backup.zip"), key="bf_dst")
+    password = st.text_input("Mật khẩu (tùy chọn)", type="password", key="bf_pw")
+    exclude = st.text_area("Loại trừ (mỗi dòng một pattern)", key="bf_exclude")
 
-        auth = st.radio("Authentication", options=["Windows", "SQL"], index=1, horizontal=True, key="sql_auth")
-        c1, c2, c3 = st.columns([1,1,1])
-        with c1:
-            username = st.text_input("User", value="", key="sql_user")
-        with c2:
-            password = st.text_input("Password", value="", type="password", key="sql_password")
-        with c3:
-            dest_dir = st.text_input("Thư mục đích (trên máy SQL Server)", value="C:\\Backup", key="sql_dest_dir")
-
-        connect = st.form_submit_button("🔗 Kết nối & tải danh sách DB")
-    if connect:
-        try:
-            server_full = server.strip()
-            if port.strip():
-                server_full = f"{server_full},{port.strip()}"
-            conn = backup_utils.mssql_connect(
-                driver=driver.strip(),
-                server=server_full,
-                auth=auth,
-                username=username.strip(),
-                password=password,
-            )
-            st.session_state["_mssql_conn"] = conn
-            # Load DBs
-            try:
-                dbs = backup_utils.mssql_list_databases(conn)
-            except Exception as e:
-                dbs = []
-                st.warning(f"Không lấy được danh sách DB: {e}")
-            st.session_state["_mssql_dbs"] = dbs
-            st.success("✅ Kết nối thành công.")
-        except Exception as e:
-            st.error(f"Lỗi kết nối: {e}")
-
-    # DB & options
-    dbs: List[str] = st.session_state.get("_mssql_dbs", []) or []
-    if dbs:
-        dbname = st.selectbox("Chọn Database", options=dbs, key="sql_dbname")
-    else:
-        dbname = st.text_input("Database (nếu không tải được danh sách)", value="", key="sql_dbname_fallback")
-
-    copt1, copt2, copt3 = st.columns(3)
-    with copt1:
-        copy_only = st.checkbox("COPY_ONLY", value=True, key="opt_copy_only")
-    with copt2:
-        compression = st.checkbox("COMPRESSION", value=True, key="opt_compression")
-    with copt3:
-        verifyonly = st.checkbox("VERIFYONLY", value=False, key="opt_verify")
-
-    cfile1, cfile2 = st.columns([2,1])
-    with cfile1:
-        file_name = st.text_input("Tên file .bak (bỏ trống = tự sinh)", value="", key="sql_filename")
-    with cfile2:
-        do_backup = st.button("📀 Backup ngay", type="primary", key="btn_sql_backup_now", use_container_width=True)
-
-    if do_backup:
-        if not server.strip():
-            st.error("Vui lòng nhập Server/Instance.")
+    if st.button("📦 Nén thư mục", key="bf_btn"):
+        if not os.path.isdir(src):
+            st.error("❌ Thư mục nguồn không tồn tại")
             return
-        chosen_db = dbname if dbs else st.session_state.get("sql_dbname_fallback", "").strip()
-        if not chosen_db:
-            st.error("Vui lòng chọn hoặc nhập Database.")
-            return
+
+        excludes = [e.strip() for e in exclude.splitlines() if e.strip()]
+        progress = st.progress(0.0)
+
+        def _cb(ratio: float):
+            progress.progress(min(1.0, ratio))
+
         try:
-            conn = st.session_state.get("_mssql_conn")
-            if conn is None:
-                # Try to connect inline
-                server_full = server.strip()
-                if port.strip():
-                    server_full = f"{server_full},{port.strip()}"
-                conn = backup_utils.mssql_connect(
-                    driver=driver.strip(),
-                    server=server_full,
-                    auth=auth,
-                    username=username.strip(),
-                    password=password,
-                )
-                st.session_state["_mssql_conn"] = conn
-
-            # filename: if empty, let utils auto-generate with timestamp
-            fname = (file_name or "").strip() or None
-            out_path = backup_utils.mssql_backup_database(
-                conn,
-                db_name=chosen_db,
-                dest_dir=dest_dir.strip(),
-                file_name=fname,
-                copy_only=copy_only,
-                compression=compression,
-                verify=verifyonly,
-            )
-            st.success(f"✅ Đã backup xong: {out_path}")
-            st.caption("Lưu ý: file .bak nằm trên **máy SQL Server** theo đường dẫn bạn đã chọn.")
-        except Exception as e:
-            st.error(f"Lỗi backup: {e}")
-
-
-# ---------------- Tab: Backup Folder ----------------
-def _tab_backup_folder() -> None:
-    st.subheader("Nén thư mục → ZIP")
-
-    c1, c2 = st.columns(2)
-    with c1:
-        src = st.text_input("Thư mục nguồn", value=os.getcwd(), key="zip_src")
-    with c2:
-        dst = st.text_input("Thư mục đích", value=os.getcwd(), key="zip_dst")
-
-    c3, c4 = st.columns(2)
-    with c3:
-        zipname = st.text_input("Tên file .zip (bỏ trống = auto)", value="", key="zip_name")
-        excludes_text = st.text_area("Loại trừ (mỗi dòng 1 pattern)", value="", key="zip_excludes")
-    with c4:
-        password = st.text_input("Mật khẩu (tuỳ chọn, cần pyzipper)", value="", type="password", key="zip_password")
-        level = st.slider("Mức nén (1=nhanh, 9=nhỏ)", min_value=1, max_value=9, value=6, key="zip_level")
-
-    excludes = [x.strip() for x in excludes_text.splitlines() if x.strip()] or None
-
-    if st.button("📦 Nén ngay", key="btn_zip_now"):
-        try:
-            pbar = st.progress(0.0)
-            def _cb(done: int, total: int):
-                frac = (done / total) if total else 0.0
-                pbar.progress(min(max(frac, 0.0), 1.0))
-
-            out_file = backup_utils.zip_folder(
-                src=src.strip(),
-                dst=dst.strip(),
-                zipname=(zipname.strip() or None),
-                password=(password or None),
+            _safe_call(
+                backup_utils.zip_folder,
+                src=src,
+                dst=dst,
+                password=password or None,
                 excludes=excludes,
-                compression_level=int(level),
                 progress_callback=_cb,
             )
-            pbar.progress(1.0)
-            st.success(f"✅ Đã tạo: {out_file}")
-            try:
-                st.download_button("⬇️ Tải file .zip", data=open(out_file, "rb"),
-                                   file_name=os.path.basename(out_file), key="dl_zip_ready")
-            except Exception:
-                pass
+            st.success(f"✅ Đã tạo file ZIP: {dst}")
+            with open(dst, "rb") as f:
+                st.download_button("⬇️ Tải ZIP", f, file_name=os.path.basename(dst))
         except Exception as e:
-            st.error(f"Lỗi nén: {e}")
+            st.error(f"Lỗi khi nén thư mục: {e}")
 
 
-# ---------------- Alias ----------------
+# ---------------- Backup SQL ----------------
+def backup_sql_tab() -> None:
+    st.subheader("Backup SQL Server → BAK")
+
+    driver = st.text_input("Driver ODBC", value="ODBC Driver 17 for SQL Server", key="sql_driver")
+    server = st.text_input("Server / Instance", value="localhost", key="sql_server")
+    port = st.text_input("Port (tùy chọn)", value="", key="sql_port")
+
+    auth = st.selectbox("Authentication", ["SQL Server Authentication", "Windows Authentication"], key="sql_auth")
+    user, pwd = "", ""
+    if auth == "SQL Server Authentication":
+        user = st.text_input("User", key="sql_user")
+        pwd = st.text_input("Password", type="password", key="sql_pwd")
+
+    if st.button("🔗 Kết nối & tải danh sách DB", key="sql_listbtn"):
+        try:
+            dbs = _safe_call(
+                backup_utils.mssql_list_databases,
+                driver=driver,
+                server=server,
+                port=port or None,
+                user=user,
+                password=pwd,
+                auth=auth,
+            )
+            st.session_state["db_list"] = dbs
+            st.success(f"Đã tải {len(dbs)} database.")
+        except Exception as e:
+            st.error(f"Lỗi: {e}")
+
+    dbs = st.session_state.get("db_list", [])
+    if dbs:
+        database = st.selectbox("Chọn Database", dbs, key="sql_db")
+    else:
+        database = st.text_input("Tên Database", key="sql_dbtxt")
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        copy_only = st.checkbox("COPY_ONLY", value=True, key="sql_copy")
+    with col2:
+        compression = st.checkbox("COMPRESSION", value=True, key="sql_comp")
+    with col3:
+        verify = st.checkbox("VERIFYONLY", value=False, key="sql_verify")
+
+    dest_dir = st.text_input("Thư mục đích trên máy SQL Server", value="C:\\Backup", key="sql_dest")
+    bak_name = st.text_input("Tên file .bak (tùy chọn)", value="", key="sql_bak")
+
+    if st.button("📀 Backup ngay", key="sql_backupbtn"):
+        if not database:
+            st.error("❌ Bạn phải nhập/chọn Database")
+            return
+        try:
+            bak_path = _safe_call(
+                backup_utils.mssql_backup_database,
+                driver=driver,
+                server=server,
+                port=port or None,
+                user=user,
+                password=pwd,
+                auth=auth,
+                database=database,
+                dest_path=dest_dir,
+                backup_file=bak_name or None,
+                copy_only=copy_only,
+                compression=compression,
+                verify_only=verify,
+            )
+            st.success(f"✅ Backup thành công: {bak_path}")
+            if os.path.exists(bak_path):
+                with open(bak_path, "rb") as f:
+                    st.download_button("⬇️ Tải file BAK", f, file_name=os.path.basename(bak_path))
+        except Exception as e:
+            st.error(f"Lỗi khi backup: {e}")
+
+
+# Giữ alias cho hệ thống import
 main = render
 
 if __name__ == "__main__":
