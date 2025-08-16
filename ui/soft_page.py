@@ -26,12 +26,14 @@ def _win_tab() -> None:
     # Danh sách ứng dụng và link tải (theo yêu cầu)
     apps: List[dict] = [
         {"name": "Activate_OW", "url": "https://www.dropbox.com/scl/fi/buicqfdwim1gg3r9wj1gn/Activate_OW.zip?rlkey=m9wmtbdit28atsej7o56zpmt7&st=dq1hrgsa&dl=1"},
-        {"name": "DropboxSetup", "url": "https://www.dropbox.com/download?plat=win"},
-        {"name": "GoogleDriveSetup", "url": "https://dl.google.com/drive-file-stream/GoogleDriveSetup.exe"},
+        {"name": "Dropbox", "url": "https://www.dropbox.com/download?plat=win"},
+        {"name": "GoogleDrive", "url": "https://dl.google.com/drive-file-stream/GoogleDriveSetup.exe"},
         {"name": "Unikey", "url": "https://www.dropbox.com/scl/fi/kqx1it8b72sfek1oyn6nq/UniKey.zip?rlkey=791rk5ngikf9kqub21tbfedzr&st=fxs9clvr&dl=1"},
         {"name": "Vietkey2000", "url": "https://www.dropbox.com/scl/fi/x03tgdg7gfq59dtpryk9c/Vietkey2000.zip?rlkey=jr90ue89tnxf276nfwp391rmk&st=6qvhmt4s&dl=1"},
         {"name": "WinRAR", "url": "https://www.dropbox.com/scl/fi/xu3thzg1kru6blo3pky6d/WinRAR.zip?rlkey=tgmviojwg5q29aodp7qxywrv7&st=8zx1fpq6&dl=1"},
         {"name": "XMind", "url": "https://www.dropbox.com/scl/fi/bf4bm8hcghts1nc8cpu7q/XMind.zip?rlkey=bozsq9lgzwhbc5tu589y05qj9&st=9hj4x86c&dl=1"},
+        {"name": "Teams", "url": "https://statics.teams.cdn.office.net/evergreen-assets/DesktopClient/MSTeamsSetup.exe"},
+        {"name": "UltraViewer_version_6.6", "url": "https://www.ultraviewer.net/vi/UltraViewer_setup_6.6_vi.exe"},
     ]
 
     # Tìm kiếm nhanh
