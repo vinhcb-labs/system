@@ -33,7 +33,7 @@ def _win_tab() -> None:
         {"name": "WinRAR", "url": "https://www.dropbox.com/scl/fi/xu3thzg1kru6blo3pky6d/WinRAR.zip?rlkey=tgmviojwg5q29aodp7qxywrv7&st=8zx1fpq6&dl=1"},
         {"name": "XMind", "url": "https://www.dropbox.com/scl/fi/bf4bm8hcghts1nc8cpu7q/XMind.zip?rlkey=bozsq9lgzwhbc5tu589y05qj9&st=9hj4x86c&dl=1"},
         {"name": "Teams", "url": "https://statics.teams.cdn.office.net/evergreen-assets/DesktopClient/MSTeamsSetup.exe"},
-        {"name": "UltraViewer_version_6.6", "url": "https://www.ultraviewer.net/vi/UltraViewer_setup_6.6_vi.exe"},
+        {"name": "UltraViewer", "url": "https://www.ultraviewer.net/vi/UltraViewer_setup_6.6_vi.exe"},
     ]
 
     # Tìm kiếm nhanh
