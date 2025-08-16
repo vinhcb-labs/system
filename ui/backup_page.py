@@ -158,7 +158,7 @@ def render():
     if HAS_PYODBC:
         drivers.append("MS SQL (pyodbc/ODBC) — Windows")
     if not drivers:
-        st.error("Không tìm thấy driver kết nối. Cài `python-tds` (khuyên dùng) hoặc `pyodbc` rồi chạy lại.")
+        st.error("Không tìm thấy kết nối. ")
         return
 
     backend = st.selectbox("Kết nối bằng", options=drivers, index=0)
@@ -183,7 +183,7 @@ def render():
                 encrypt = st.checkbox("Encrypt TLS", value=True)
                 validate_cert = st.checkbox("Validate certificate", value=False)
 
-        btn_conn = st.button("🔌 Kết nối & lấy danh sách DB", use_container_width=True)
+        btn_conn = st.button("🔌 Lấy DB", use_container_width=True)
 
     db_list = st.session_state.get("mssql_db_list", [])
     if btn_conn:
@@ -236,7 +236,7 @@ def render():
     with colB:
         dest_folder = st.text_input(
             "Thư mục đích trên MÁY SQL (ví dụ Windows: D:\\SQLBackups | Linux: /var/opt/mssql/backups)",
-            value=r"D:\SQLBackups" if os.name == "nt" else "/var/opt/mssql/backups"
+            value=r"D:\SQLBackups" if os.name == "nt" else " "
         )
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         default_name = f"{dbname}_{kind}_{ts}.bak" if dbname else f"backup_{ts}.bak"
