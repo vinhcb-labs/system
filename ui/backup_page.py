@@ -1,8 +1,9 @@
 # ui/backup_page.py
 from __future__ import annotations
 import os
+import socket
 import streamlit as st
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, List, Optional, Tuple
 
 from core import backup_utils
 
@@ -28,9 +29,7 @@ def _safe_call(func: Callable, **kwargs) -> Any:
     return func(**mapped)
 
 def _normalize_host_for_port(server: str) -> str:
-    """
-    Nếu server có dạng 'HOST\\INSTANCE' và có Port thì chỉ lấy 'HOST'.
-    """
+    """Nếu server có dạng 'HOST\\INSTANCE' và có Port thì chỉ lấy 'HOST'."""
     server = (server or "").strip()
     if "\\" in server:
         host, _instance = server.split("\\", 1)
@@ -49,6 +48,44 @@ def _build_server_for_odbc(server: str, port: Optional[str]) -> str:
         return f"{host},{int(port)}"
     return server
 
+# ---- Dò driver ODBC SQL Server có sẵn ----
+def _list_sql_odbc_drivers() -> List[str]:
+    try:
+        import pyodbc
+        return [d for d in pyodbc.drivers() if "SQL Server" in d]
+    except Exception:
+        return []
+
+def _pick_installed_sql_driver(preferred_label: str) -> str:
+    """
+    Trả về tên driver ODBC SQL Server đã cài (đúng chính tả).
+    - Nếu preferred_label có sẵn -> dùng luôn.
+    - Nếu không -> chọn driver SQL Server có version cao nhất hiện có.
+    - Nếu máy chưa có driver SQL Server -> raise RuntimeError.
+    """
+    import re
+    installed = _list_sql_odbc_drivers()
+    preferred = (preferred_label or "").strip()
+    if preferred in installed:
+        return preferred
+    if installed:
+        def ver(n: str) -> int:
+            import re as _re
+            m = _re.search(r"(\d+)", n)
+            return int(m.group(1)) if m else -1
+        return sorted(installed, key=ver, reverse=True)[0]
+    raise RuntimeError(
+        "Không tìm thấy ODBC driver cho SQL Server trên hệ thống. "
+        "Vui lòng cài 'ODBC Driver 18 for SQL Server' (khuyến nghị) hoặc 'ODBC Driver 17 for SQL Server'."
+    )
+
+def _driver_label_to_braced(driver_label: str) -> str:
+    """Đổi tên driver sang dạng có ngoặc nhọn đúng chuẩn ODBC."""
+    d = (driver_label or "").strip()
+    if d.startswith("{") and d.endswith("}"):
+        return d
+    return "{" + d + "}"
+
 def build_connection_string(
     driver: str,
     server_input: str,
@@ -66,16 +103,12 @@ def build_connection_string(
     Trả về pyodbc connection string cho SQL Server (ODBC 17/18).
     - Nếu có port -> luôn dùng HOST,PORT (không phụ thuộc SQL Browser).
     - Nếu không có port nhưng có INSTANCE -> dùng HOST\\INSTANCE (cần SQL Browser UDP 1434).
+    - Tự dò và chọn driver phù hợp nếu driver mong muốn không tồn tại.
     """
-    drv_raw = (driver or "").strip()
-    if "18" in drv_raw:
-        drv = "{ODBC Driver 18 for SQL Server}"
-        default_encrypt = True
-    else:
-        drv = "{ODBC Driver 17 for SQL Server}"
-        default_encrypt = False
+    resolved = _pick_installed_sql_driver(driver or "ODBC Driver 18 for SQL Server")
+    drv = _driver_label_to_braced(resolved)
+    default_encrypt = ("18" in resolved)
 
-    # Ghép server đúng quy tắc
     server_value = _build_server_for_odbc(server_input, str(port) if port is not None and str(port).strip() else None)
 
     parts = [
@@ -109,25 +142,111 @@ def build_connection_string(
 
     return ";".join(parts) + ";"
 
+# ---- Preflight checks: DNS & Port ----
+def _preflight_checks(server_input: str, port: Optional[str], timeout_s: int = 3) -> List[str]:
+    """
+    Trả về list cảnh báo/tình trạng trước khi connect:
+    - Resolve tên host
+    - Ping TCP port (connect socket) nếu có port
+    """
+    msgs: List[str] = []
+    host = _normalize_host_for_port(server_input)
+    try:
+        ip = socket.gethostbyname(host)
+        msgs.append(f"🧭 DNS: {host} → {ip}")
+    except Exception as e:
+        msgs.append(f"⚠️ DNS: Không resolve được '{host}': {e}")
+
+    p = (port or "").strip()
+    if p:
+        try:
+            with socket.create_connection((host, int(p)), timeout=timeout_s):
+                msgs.append(f"🔌 TCP: Kết nối được {host}:{p}")
+        except Exception as e:
+            msgs.append(f"❌ TCP: Không kết nối được {host}:{p} - {e}")
+    else:
+        msgs.append("ℹ️ Bạn không nhập Port → Nếu dùng SERVER\\INSTANCE, cần SQL Browser (UDP 1434) và mở firewall.")
+
+    return msgs
+
+# ---- Thử nhiều driver tự động ----
+def _candidate_drivers(preferred: str) -> List[str]:
+    installed = _list_sql_odbc_drivers()
+    if not installed:
+        return [preferred]  # để lỗi rõ ràng hơn ở bước sau
+    # sắp xếp theo số phiên bản (18 > 17 > 13 ...)
+    def ver(n: str) -> int:
+        import re
+        m = re.search(r"(\d+)", n)
+        return int(m.group(1)) if m else -1
+    ordered = sorted(installed, key=ver, reverse=True)
+    # đưa preferred lên đầu nếu có
+    if preferred in ordered:
+        ordered.remove(preferred)
+        ordered.insert(0, preferred)
+    return ordered
+
+def _connect_once(conn_str: str, timeout_s: int) -> Tuple[bool, str]:
+    import pyodbc
+    try:
+        with pyodbc.connect(conn_str, timeout=timeout_s) as cn:
+            return True, cn.getinfo(pyodbc.SQL_SERVER_NAME)
+    except pyodbc.Error as e:
+        # gom thông điệp lỗi chi tiết
+        details = []
+        for arg in getattr(e, "args", []):
+            details.append(str(arg))
+        text = "; ".join(details) if details else str(e)
+        return False, text
+    except Exception as e:
+        return False, str(e)
+
 def _try_connect_pyodbc(driver: str, server: str, port: Optional[str],
                         auth: str, user: str, pwd: str,
                         encrypt: bool, trust: bool, timeout_s: int = 8) -> str:
-    """Thử kết nối nhanh để bắt lỗi HYT00 ngay trong UI (không đụng logic utils)."""
-    import pyodbc
-    conn_str = build_connection_string(
-        driver=driver,
-        server_input=server,
-        port=(port.strip() if isinstance(port, str) else port),
-        database="master",
-        auth_mode=("windows" if auth == "Windows Authentication" else "sql"),
-        user=(user or None),
-        password=(pwd or None),
-        encrypt=encrypt,
-        trust_server_certificate=trust,
-        timeout=timeout_s,
-    )
-    with pyodbc.connect(conn_str, timeout=timeout_s) as cn:
-        return f"OK. Server name: {cn.getinfo(pyodbc.SQL_SERVER_NAME)}"
+    """Thử kết nối nhanh: preflight + thử nhiều driver nếu cần."""
+    try:
+        import pyodbc  # noqa: F401
+    except Exception as e:
+        raise RuntimeError("Chưa cài thư viện 'pyodbc'. Vui lòng chạy: pip install pyodbc") from e
+
+    # Preflight
+    for line in _preflight_checks(server, port, timeout_s=3):
+        st.info(line)
+
+    # Danh sách driver sẽ thử
+    drivers = _candidate_drivers(driver or "ODBC Driver 18 for SQL Server")
+    last_error = None
+    for drv in drivers:
+        try:
+            conn_str = build_connection_string(
+                driver=drv,
+                server_input=server,
+                port=(port.strip() if isinstance(port, str) else port),
+                database="master",
+                auth_mode=("windows" if auth == "Windows Authentication" else "sql"),
+                user=(user or None),
+                password=(pwd or None),
+                encrypt=encrypt,
+                trust_server_certificate=trust,
+                timeout=timeout_s,
+            )
+        except Exception as e:
+            last_error = f"[{drv}] build conn string lỗi: {e}"
+            continue
+
+        ok, info = _connect_once(conn_str, timeout_s=timeout_s)
+        if ok:
+            return f"OK. Driver: {drv} | Server name: {info}"
+        else:
+            last_error = f"[{drv}] {info}"
+            # Nếu lỗi thuộc nhóm kết nối/driver, tiếp tục thử driver kế
+            # IM002 (driver/DSN), 08001 (connection open), HYT00 (timeout), 28000 (login failed)
+            if not any(code in info for code in ("IM002", "08001", "HYT00", "28000")):
+                # lỗi kiểu khác (ví dụ syntax) -> dừng ngay
+                break
+
+    raise RuntimeError(last_error or "Không kết nối được với bất kỳ driver nào.")
 
 # ---------------- Page ----------------
 def render() -> None:
@@ -180,7 +299,7 @@ def backup_folder_tab() -> None:
 
 # ---------------- Backup SQL ----------------
 def backup_sql_tab() -> None:
-    st.subheader("Backup SQL Server → BAK")
+    st.subheader("Backup SQL Server ")
 
     # ---- Kết nối ----
     col1, col2 = st.columns(2)
@@ -206,7 +325,6 @@ def backup_sql_tab() -> None:
 
     ecol, tcol = st.columns(2)
     with ecol:
-        # Với Driver 18, Encrypt nên bật. Vẫn cho phép tắt nếu cần.
         encrypt = st.checkbox("Encrypt", value=("18" in driver), key="sql_encrypt")
     with tcol:
         trust = st.checkbox("Trust server certificate", value=True, key="sql_trust")
@@ -220,6 +338,13 @@ def backup_sql_tab() -> None:
     # ---- Test nhanh kết nối ----
     if st.button("🧪 Test connection", key="sql_test"):
         try:
+            # In ra danh sách driver sẵn có (nếu có pyodbc)
+            drivers = _list_sql_odbc_drivers()
+            if drivers:
+                st.info(f"Drivers ODBC SQL Server đã cài: {', '.join(drivers)}")
+            else:
+                st.info("Chưa dò được driver hệ thống (có thể chưa cài pyodbc hoặc chưa có driver).")
+
             msg = _try_connect_pyodbc(driver, server, port, auth, user, pwd, encrypt, trust, timeout_s=8)
             st.success(msg)
         except Exception as e:
@@ -230,13 +355,12 @@ def backup_sql_tab() -> None:
     # ---- Tải danh sách DB ----
     if st.button("🔗 Kết nối & tải danh sách DB", key="sql_listbtn"):
         try:
-            # server đã được chuẩn hoá về HOST,PORT nếu có port
             server_for_utils = _build_server_for_odbc(server, port)
             dbs: List[str] = _safe_call(
                 backup_utils.mssql_list_databases,
                 driver=driver,
                 server=server_for_utils,
-                port=None,  # utils không cần port riêng khi đã ghép
+                port=None,
                 user=user,
                 password=pwd,
                 auth=auth,
