@@ -1,502 +1,355 @@
 # ui/backup_page.py
 from __future__ import annotations
 import os
+import sys
 import socket
+import platform
+import datetime as dt
+from typing import List, Optional, Tuple
+
 import streamlit as st
-from typing import Any, Callable, List, Optional, Tuple
 
-from core import backup_utils
+# ======================== HỆ ĐIỀU HÀNH & THƯ VIỆN =========================
+if platform.system() != "Windows":
+    st.error("Công cụ này chỉ hỗ trợ Windows (để dò instance qua Registry).")
+    st.stop()
 
-# ---------------- Small helpers ----------------
-def _safe_call(func: Callable, **kwargs) -> Any:
-    """Gọi hàm backup_utils với tên tham số có thể khác nhau (map alias)."""
-    import inspect
-    sig = inspect.signature(func)
-    mapped = {}
-    for name in sig.parameters.keys():
-        if name in kwargs:
-            mapped[name] = kwargs[name]
-        else:
-            # map alias phổ biến
-            if name in ("src_dir", "src"): mapped[name] = kwargs.get("src") or kwargs.get("src_dir")
-            if name in ("dst_dir", "dst"): mapped[name] = kwargs.get("dst") or kwargs.get("dst_dir")
-            if name in ("excludes", "exclude_globs"): mapped[name] = kwargs.get("excludes") or kwargs.get("exclude_globs")
-            if name in ("progress_callback", "progress_cb"): mapped[name] = kwargs.get("progress_callback") or kwargs.get("progress_cb")
-            if name in ("server", "server_instance"): mapped[name] = kwargs.get("server") or kwargs.get("server_instance")
-            if name in ("database", "db"): mapped[name] = kwargs.get("database") or kwargs.get("db")
-            if name in ("dest_path", "dst"): mapped[name] = kwargs.get("dest_path") or kwargs.get("dst")
-            if name in ("backup_file", "filename"): mapped[name] = kwargs.get("backup_file") or kwargs.get("filename")
-    return func(**mapped)
+try:
+    import pyodbc
+except Exception:
+    st.error("Thiếu thư viện 'pyodbc'. Vui lòng cài:  \n`pip install pyodbc`")
+    st.stop()
 
-def _sig_has_param(func: Callable, param_name: str) -> bool:
-    import inspect
-    try:
-        return param_name in inspect.signature(func).parameters
-    except Exception:
-        return False
+try:
+    import winreg  # chuẩn Windows, không cần cài thêm
+except Exception:
+    st.error("Không truy cập được Windows Registry (winreg).")
+    st.stop()
 
-def _normalize_host_for_port(server: str) -> str:
-    """Nếu server có dạng 'HOST\\INSTANCE' và có Port thì chỉ lấy 'HOST'."""
-    server = (server or "").strip()
-    if "\\" in server:
-        host, _instance = server.split("\\", 1)
-        return host.strip()
-    return server
 
-def _build_server_for_odbc(server: str, port: Optional[str]) -> str:
+# ============================ TIỆN ÍCH CHUNG ===============================
+def _pick_sql_odbc_driver() -> str:
     """
-    - Nếu có port -> trả về 'HOST,PORT' (tự loại bỏ '\INSTANCE' nếu có).
-    - Nếu không port -> trả về 'SERVER' nguyên gốc (có thể là 'HOST' hoặc 'HOST\\INSTANCE').
+    Chọn driver ODBC SQL Server tốt nhất:
+    - Ưu tiên 'ODBC Driver 18 for SQL Server'
+    - Sau đó 'ODBC Driver 17 for SQL Server'
+    - Nếu chỉ còn 'SQL Server' (DBNETLIB) -> báo lỗi vì quá cũ/TLS.
     """
-    server = (server or "").strip()
-    port = (port or "").strip()
-    if port:
-        host = _normalize_host_for_port(server)
-        return f"{host},{int(port)}"
-    return server
-
-# ---- Dò driver ODBC SQL Server có sẵn ----
-def _list_sql_odbc_drivers() -> List[str]:
-    try:
-        import pyodbc
-        return [d for d in pyodbc.drivers() if "SQL Server" in d]
-    except Exception:
-        return []
-
-def _pick_installed_sql_driver(preferred_label: str) -> str:
-    """
-    Trả về tên driver ODBC SQL Server đã cài (đúng chính tả).
-    - Nếu preferred_label có sẵn -> dùng luôn.
-    - Nếu không -> chọn driver SQL Server có version cao nhất hiện có.
-    - Nếu máy chưa có driver SQL Server -> raise RuntimeError.
-    """
-    import re
-    installed = _list_sql_odbc_drivers()
-    preferred = (preferred_label or "").strip()
-    if preferred in installed:
-        return preferred
-    if installed:
-        def ver(n: str) -> int:
-            m = re.search(r"(\d+)", n)
-            return int(m.group(1)) if m else -1
-        return sorted(installed, key=ver, reverse=True)[0]
+    drivers = [d.strip() for d in pyodbc.drivers() if "SQL Server" in d]
+    if "ODBC Driver 18 for SQL Server" in drivers:
+        return "ODBC Driver 18 for SQL Server"
+    if "ODBC Driver 17 for SQL Server" in drivers:
+        return "ODBC Driver 17 for SQL Server"
+    if "SQL Server" in drivers:
+        raise RuntimeError(
+            "Chỉ phát hiện driver cũ 'SQL Server' (DBNETLIB) — không hỗ trợ TLS/Encrypt hiện đại.\n"
+            "Hãy cài 'ODBC Driver 18 for SQL Server' (khuyến nghị) hoặc 'ODBC Driver 17 for SQL Server'."
+        )
     raise RuntimeError(
-        "Không tìm thấy ODBC driver cho SQL Server trên hệ thống. "
-        "Vui lòng cài 'ODBC Driver 18 for SQL Server' (khuyến nghị) hoặc 'ODBC Driver 17 for SQL Server'."
+        "Không tìm thấy driver ODBC cho SQL Server.\n"
+        "Hãy cài 'ODBC Driver 18 for SQL Server' (khuyến nghị) hoặc 'ODBC Driver 17 for SQL Server'."
     )
 
-def _driver_label_to_braced(driver_label: str) -> str:
-    """Đổi tên driver sang dạng có ngoặc nhọn đúng chuẩn ODBC."""
-    d = (driver_label or "").strip()
-    if d.startswith("{") and d.endswith("}"):
-        return d
-    return "{" + d + "}"
 
-def build_connection_string(
+def _build_server_for_odbc(host: str, instance_name: Optional[str], port: Optional[int]) -> str:
+    """
+    - Nếu có port: trả 'HOST,PORT' (ổn định, không cần SQL Browser).
+    - Nếu không có port:
+        + Instance mặc định: 'HOST'
+        + Instance tên riêng: 'HOST\\INSTANCE' (cần SQL Browser UDP 1434).
+    """
+    host = (host or "localhost").strip()
+    if port:
+        return f"{host},{int(port)}"
+    if instance_name and instance_name.upper() != "MSSQLSERVER":
+        return f"{host}\\{instance_name}"
+    return host
+
+
+def _tcp_probe(host: str, port: Optional[int], timeout=2) -> Tuple[bool, str]:
+    if not port:
+        return True, "Không có Port cố định (sẽ cần SQL Browser nếu dùng \\INSTANCE)."
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return True, f"TCP OK {host}:{port}"
+    except Exception as e:
+        return False, f"TCP FAIL {host}:{port} - {e}"
+
+
+def _odbc_conn_str(
     driver: str,
-    server_input: str,
-    port: str | int | None = None,
-    database: str | None = "master",
-    auth_mode: str = "sql",          # "sql" | "windows"
-    user: str | None = None,
-    password: str | None = None,
-    encrypt: bool | None = None,     # None = tự động theo driver
+    server_value: str,
+    database: str = "master",
+    auth: str = "windows",  # "windows" | "sql"
+    user: Optional[str] = None,
+    password: Optional[str] = None,
+    encrypt: Optional[bool] = None,  # None -> auto theo driver
     trust_server_certificate: bool = True,
     timeout: int = 8,
-    application_intent: str | None = None,  # e.g. "ReadOnly"
 ) -> str:
-    """
-    Trả về pyodbc connection string cho SQL Server (ODBC 17/18).
-    - Nếu có port -> luôn dùng HOST,PORT (không phụ thuộc SQL Browser).
-    - Nếu không có port nhưng có INSTANCE -> dùng HOST\\INSTANCE (cần SQL Browser UDP 1434).
-    - Tự dò và chọn driver phù hợp nếu driver mong muốn không tồn tại.
-    """
-    resolved = _pick_installed_sql_driver(driver or "ODBC Driver 18 for SQL Server")
-    drv = _driver_label_to_braced(resolved)
-    default_encrypt = ("18" in resolved)
-
-    server_value = _build_server_for_odbc(server_input, str(port) if port is not None and str(port).strip() else None)
-
     parts = [
-        f"Driver={drv}",
+        f"Driver={{{driver}}}".format(driver=driver),
         f"Server={server_value}",
+        f"Database={database}",
         f"Connection Timeout={int(timeout)}",
     ]
-    if database:
-        parts.append(f"Database={database}")
+    # Encrypt mặc định cho Driver 18 là Yes
+    use_encrypt = (encrypt if encrypt is not None else ("18" in driver))
+    parts.append("Encrypt=Yes" if use_encrypt else "Encrypt=No")
+    if use_encrypt and trust_server_certificate:
+        parts.append("TrustServerCertificate=Yes")
 
-    use_encrypt = default_encrypt if encrypt is None else bool(encrypt)
-    if use_encrypt:
-        parts.append("Encrypt=yes")
-        if trust_server_certificate:
-            parts.append("TrustServerCertificate=yes")
+    if auth.lower().startswith("win"):
+        parts.append("Trusted_Connection=Yes")
     else:
-        parts.append("Encrypt=no")
-
-    if application_intent:
-        parts.append(f"Application Intent={application_intent}")
-
-    if auth_mode.lower().startswith("win"):
-        parts.append("Trusted_Connection=yes")
-    else:
-        if not user:
-            raise ValueError("auth_mode='sql' yêu cầu user.")
-        if password is None:
-            raise ValueError("auth_mode='sql' yêu cầu password.")
+        if not user or password is None:
+            raise ValueError("SQL Authentication yêu cầu user/password.")
         parts.append(f"UID={user}")
         parts.append(f"PWD={password}")
 
     return ";".join(parts) + ";"
 
-# ---- mở kết nối pyodbc (dùng cho utils cần cnxn) ----
-def _open_py_cnxn(
-    driver: str, server: str, port: Optional[str],
-    auth: str, user: str, pwd: str,
-    encrypt: bool, trust: bool, timeout_s: int = 8,
-    database: str = "master"
-):
-    import pyodbc
-    conn_str = build_connection_string(
+
+# ===================== DÒ INSTANCE QUA REGISTRY (LOCAL) ====================
+def _read_reg_value(root, path: str, name: str) -> Optional[str]:
+    try:
+        key = winreg.OpenKey(root, path)
+        val, _ = winreg.QueryValueEx(key, name)
+        winreg.CloseKey(key)
+        return str(val)
+    except Exception:
+        return None
+
+
+def _enum_reg_values(root, path: str) -> List[Tuple[str, str]]:
+    """Trả về danh sách (value_name, value_data) trong key."""
+    results = []
+    try:
+        key = winreg.OpenKey(root, path)
+    except Exception:
+        return results
+
+    i = 0
+    while True:
+        try:
+            name, val, _ = winreg.EnumValue(key, i)
+            results.append((name, str(val)))
+            i += 1
+        except OSError:
+            break
+    winreg.CloseKey(key)
+    return results
+
+
+def detect_local_instances() -> List[dict]:
+    """
+    Tìm SQL Server instances cài trên máy:
+      HKLM\SOFTWARE\Microsoft\Microsoft SQL Server\Instance Names\SQL
+      HKLM\SOFTWARE\WOW6432Node\Microsoft\Microsoft SQL Server\Instance Names\SQL
+    Lấy thêm Port từ:
+      HKLM\SOFTWARE\Microsoft\Microsoft SQL Server\<InstanceID>\MSSQLServer\SuperSocketNetLib\Tcp\IPAll
+    Trả về list dict: {instance, instance_id, port (int|None)}
+    """
+    ROOT = winreg.HKEY_LOCAL_MACHINE
+    paths = [
+        r"SOFTWARE\Microsoft\Microsoft SQL Server\Instance Names\SQL",
+        r"SOFTWARE\WOW6432Node\Microsoft\Microsoft SQL Server\Instance Names\SQL",
+    ]
+
+    found: dict[str, str] = {}  # instance_name -> instance_id
+    for p in paths:
+        for name, inst_id in _enum_reg_values(ROOT, p):
+            # name: 'MSSQLSERVER' | 'SQLEXPRESS' ...
+            # inst_id: 'MSSQL15.MSSQLSERVER' | 'MSSQL16.SQLEXPRESS' ...
+            if name not in found:
+                found[name] = inst_id
+
+    instances: List[dict] = []
+    for inst_name, inst_id in found.items():
+        tcp_path = rf"SOFTWARE\Microsoft\Microsoft SQL Server\{inst_id}\MSSQLServer\SuperSocketNetLib\Tcp\IPAll"
+        tcp_path_wow = rf"SOFTWARE\WOW6432Node\Microsoft\Microsoft SQL Server\{inst_id}\MSSQLServer\SuperSocketNetLib\Tcp\IPAll"
+
+        tcp_port = _read_reg_value(ROOT, tcp_path, "TcpPort") or _read_reg_value(ROOT, tcp_path_wow, "TcpPort")
+        tcp_dyn = _read_reg_value(ROOT, tcp_path, "TcpDynamicPorts") or _read_reg_value(ROOT, tcp_path_wow, "TcpDynamicPorts")
+
+        port: Optional[int] = None
+        if tcp_port and tcp_port.strip().isdigit():
+            port = int(tcp_port.strip())
+        elif tcp_dyn:
+            # 1 số bản đặt DynamicPorts là "0" hoặc chuỗi nhiều giá trị; chọn số đầu tiên hợp lệ
+            for token in filter(None, [x.strip() for x in tcp_dyn.split(",")]):
+                if token.isdigit():
+                    port = int(token)
+                    break
+
+        instances.append({
+            "instance": inst_name,          # 'MSSQLSERVER' | 'SQLEXPRESS' ...
+            "instance_id": inst_id,         # 'MSSQL16.SQLEXPRESS' ...
+            "port": port                    # int | None
+        })
+
+    # Ưu tiên instance mặc định trên cùng
+    instances.sort(key=lambda x: (x["instance"] != "MSSQLSERVER", x["instance"]))
+    return instances
+
+
+# =========================== HÀM LÀM VIỆC VỚI DB ===========================
+def open_connection(server_value: str, auth: str, user: Optional[str], pwd: Optional[str]) -> pyodbc.Connection:
+    driver = _pick_sql_odbc_driver()
+    conn_str = _odbc_conn_str(
         driver=driver,
-        server_input=server,
-        port=(port.strip() if isinstance(port, str) else port),
-        database=database,
-        auth_mode=("windows" if auth == "Windows Authentication" else "sql"),
-        user=(user or None),
-        password=(pwd or None),
-        encrypt=encrypt,
-        trust_server_certificate=trust,
-        timeout=timeout_s,
+        server_value=server_value,
+        database="master",
+        auth=("windows" if auth == "Windows Authentication" else "sql"),
+        user=user,
+        password=pwd,
+        encrypt=None,  # auto
+        trust_server_certificate=True,
+        timeout=8,
     )
-    return pyodbc.connect(conn_str, timeout=timeout_s)
+    return pyodbc.connect(conn_str, timeout=8)
 
-# ---- Preflight checks: DNS & Port ----
-def _preflight_checks(server_input: str, port: Optional[str], timeout_s: int = 3) -> Tuple[List[str], bool]:
-    """
-    Trả về (messages, tcp_ok):
-    - Resolve tên host
-    - Ping TCP port (connect socket) nếu có port
-    """
-    msgs: List[str] = []
-    host = _normalize_host_for_port(server_input)
-    tcp_ok = True
 
-    try:
-        ip = socket.gethostbyname(host)
-        msgs.append(f"🧭 DNS: {host} → {ip}")
-    except Exception as e:
-        msgs.append(f"⚠️ DNS: Không resolve được '{host}': {e}")
+def list_databases(cnxn: pyodbc.Connection, include_system: bool = False) -> List[str]:
+    sql = "SELECT name FROM sys.databases"
+    if not include_system:
+        sql += " WHERE name NOT IN ('master','tempdb','model','msdb')"
+    sql += " ORDER BY name;"
+    cur = cnxn.cursor()
+    rows = cur.execute(sql).fetchall()
+    return [r[0] for r in rows]
 
-    p = (port or "").strip()
-    if p:
+
+def backup_database(cnxn: pyodbc.Connection, db: str, dest_dir: str, file_name: Optional[str] = None,
+                    copy_only: bool = True, compression: bool = True, verify: bool = False) -> str:
+    db_q = "[" + db.replace("]", "]]") + "]"
+    os.makedirs(dest_dir, exist_ok=True)  # tạo thư mục trên máy local; với local SQL cũng hữu ích
+
+    if not file_name:
+        ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        file_name = f"{db}_{ts}.bak"
+
+    full_path = os.path.abspath(os.path.join(dest_dir, file_name))
+
+    # Lưu ý: backup chạy TRÊN SQL SERVER. Nếu SQL là local thì đường dẫn local giống nhau.
+    # Nếu SQL ở máy khác -> đường dẫn phải là thư mục của MÁY SQL, không phải máy client.
+    opts = []
+    if copy_only:
+        opts.append("COPY_ONLY")
+    if compression:
+        opts.append("COMPRESSION")
+    opts.append("INIT")
+    opts.append("STATS=10")
+    with cnxn.cursor() as cur:
+        cur.execute(f"BACKUP DATABASE {db_q} TO DISK = ? WITH {', '.join(opts)};", (full_path,))
+        cur.commit()
+        if verify:
+            cur.execute("RESTORE VERIFYONLY FROM DISK = ?;", (full_path,))
+            cur.commit()
+    return full_path
+
+
+# ================================== UI =====================================
+def render():
+    st.title("SQL Server — Auto Detect & Backup")
+
+    # --------- Phát hiện instance cục bộ ----------
+    with st.expander("🔎 Instances phát hiện trên máy (Registry)", expanded=True):
         try:
-            with socket.create_connection((host, int(p)), timeout=timeout_s):
-                msgs.append(f"🔌 TCP: Kết nối được {host}:{p}")
-                tcp_ok = True
-        except Exception as e:
-            msgs.append(f"❌ TCP: Không kết nối được {host}:{p} - {e}")
-            tcp_ok = False
-    else:
-        msgs.append("ℹ️ Bạn không nhập Port → Nếu dùng SERVER\\INSTANCE, cần SQL Browser (UDP 1434) và mở firewall.")
-
-    return msgs, tcp_ok
-
-# ---- Thử nhiều driver tự động ----
-def _candidate_drivers(preferred: str) -> List[str]:
-    installed = _list_sql_odbc_drivers()
-    if not installed:
-        return [preferred]
-    def ver(n: str) -> int:
-        import re
-        m = re.search(r"(\d+)", n)
-        return int(m.group(1)) if m else -1
-    ordered = sorted(installed, key=ver, reverse=True)
-    if preferred in ordered:
-        ordered.remove(preferred)
-        ordered.insert(0, preferred)
-    return ordered
-
-def _connect_once(conn_str: str, timeout_s: int) -> Tuple[bool, str]:
-    import pyodbc
-    try:
-        with pyodbc.connect(conn_str, timeout=timeout_s) as cn:
-            return True, cn.getinfo(pyodbc.SQL_SERVER_NAME)
-    except pyodbc.Error as e:
-        details = []
-        for arg in getattr(e, "args", []):
-            details.append(str(arg))
-        text = "; ".join(details) if details else str(e)
-        return False, text
-    except Exception as e:
-        return False, str(e)
-
-def _try_connect_pyodbc(driver: str, server: str, port: Optional[str],
-                        auth: str, user: str, pwd: str,
-                        encrypt: bool, trust: bool, timeout_s: int = 8) -> str:
-    """Thử kết nối nhanh: preflight + thử nhiều driver nếu cần, chặn driver DBNETLIB."""
-    try:
-        import pyodbc  # noqa: F401
-    except Exception as e:
-        raise RuntimeError("Chưa cài thư viện 'pyodbc'. Vui lòng chạy: pip install pyodbc") from e
-
-    # Nếu chỉ có driver cũ "SQL Server" (DBNETLIB) -> cảnh báo và dừng
-    drivers_now = _list_sql_odbc_drivers()
-    if drivers_now and set(drivers_now) == {"SQL Server"}:
-        raise RuntimeError("Driver hiện tại là 'SQL Server' (DBNETLIB) — quá cũ và không hỗ trợ TLS/Encrypt. "
-                           "Hãy cài 'ODBC Driver 18 for SQL Server' hoặc 'ODBC Driver 17 for SQL Server'.")
-
-    msgs, tcp_ok = _preflight_checks(server, port, timeout_s=3)
-    for line in msgs:
-        st.info(line)
-    if (port or "").strip() and not tcp_ok:
-        raise RuntimeError("TCP tới SQL Server không mở hoặc bị chặn. Kiểm tra lại Port/TCP/IP & Firewall/SQL Server TCP/IP.")
-
-    drivers = _candidate_drivers(driver or "ODBC Driver 18 for SQL Server")
-    last_error = None
-    for drv in drivers:
-        try:
-            conn_str = build_connection_string(
-                driver=drv,
-                server_input=server,
-                port=(port.strip() if isinstance(port, str) else port),
-                database="master",
-                auth_mode=("windows" if auth == "Windows Authentication" else "sql"),
-                user=(user or None),
-                password=(pwd or None),
-                encrypt=encrypt,
-                trust_server_certificate=trust,
-                timeout=timeout_s,
-            )
-        except Exception as e:
-            last_error = f"[{drv}] build conn string lỗi: {e}"
-            continue
-
-        ok, info = _connect_once(conn_str, timeout_s=timeout_s)
-        if ok:
-            return f"OK. Driver: {drv} | Server name: {info}"
-        else:
-            last_error = f"[{drv}] {info}"
-            if not any(code in info for code in ("IM002", "08001", "HYT00", "28000")):
-                break
-
-    raise RuntimeError(last_error or "Không kết nối được với bất kỳ driver nào.")
-
-# ---------------- Page ----------------
-def render() -> None:
-    st.title("Backup Tools")
-    tabs = st.tabs(["BackupSQL", "Backup Folder..."])
-    with tabs[0]:
-        backup_sql_tab()
-    with tabs[1]:
-        backup_folder_tab()
-
-# ---------------- Backup Folder ----------------
-def backup_folder_tab() -> None:
-    st.subheader("Backup Folder → ZIP")
-
-    src = st.text_input("Thư mục nguồn", key="bf_src")
-    dst = st.text_input("File ZIP đích", value=os.path.join(os.getcwd(), "backup.zip"), key="bf_dst")
-    password = st.text_input("Mật khẩu (tùy chọn)", type="password", key="bf_pw")
-    exclude = st.text_area("Loại trừ (mỗi dòng một pattern)", key="bf_exclude")
-
-    if st.button("📦 Nén thư mục", key="bf_btn"):
-        if not os.path.isdir(src):
-            st.error("❌ Thư mục nguồn không tồn tại")
-            return
-        excludes = [e.strip() for e in exclude.splitlines() if e.strip()]
-        progress = st.progress(0.0)
-
-        def _cb(ratio: float):
-            try:
-                progress.progress(min(1.0, max(0.0, float(ratio))))
-            except Exception:
-                pass
-
-        try:
-            _safe_call(
-                backup_utils.zip_folder,
-                src=src,
-                dst=dst,
-                password=password or None,
-                excludes=excludes or None,
-                progress_callback=_cb,
-            )
-            st.success(f"✅ Đã tạo file ZIP: {dst}")
-            try:
-                with open(dst, "rb") as f:
-                    st.download_button("⬇️ Tải ZIP", f, file_name=os.path.basename(dst), key="bf_dlzip")
-            except Exception:
-                pass
-        except Exception as e:
-            st.error(f"Lỗi khi nén thư mục: {e}")
-
-# ---------------- Backup SQL ----------------
-def backup_sql_tab() -> None:
-    st.subheader("Backup SQL Server → BAK")
-
-    # ---- Kết nối ----
-    col1, col2 = st.columns(2)
-    with col1:
-        driver = st.selectbox(
-            "Driver ODBC",
-            ["ODBC Driver 18 for SQL Server", "ODBC Driver 17 for SQL Server"],
-            index=1,
-            key="sql_driver",
-        )
-        server = st.text_input("Server / Instance", value="localhost", key="sql_server")
-    with col2:
-        port = st.text_input("Port (tùy chọn, nên điền để tránh phụ thuộc SQL Browser)", value="", key="sql_port")
-
-    auth = st.radio("Authentication", ["SQL Server Authentication", "Windows Authentication"], horizontal=True, key="sql_auth")
-    user, pwd = "", ""
-    if auth == "SQL Server Authentication":
-        ucol, pcol = st.columns(2)
-        with ucol:
-            user = st.text_input("User", key="sql_user")
-        with pcol:
-            pwd = st.text_input("Password", type="password", key="sql_pwd")
-
-    ecol, tcol = st.columns(2)
-    with ecol:
-        encrypt = st.checkbox("Encrypt", value=("18" in driver), key="sql_encrypt")
-    with tcol:
-        trust = st.checkbox("Trust server certificate", value=True, key="sql_trust")
-
-    if "\\" in (server or "") and not (port or "").strip():
-        st.warning(
-            "Bạn đang dùng dạng SERVER\\INSTANCE **mà không nhập Port** → cần dịch vụ **SQL Browser (UDP 1434)** và mở firewall. "
-            "Khuyến nghị: nhập Port (thường 1433) để ghép chuỗi **SERVER,PORT** cho ổn định."
-        )
-
-    # ---- Test nhanh kết nối ----
-    if st.button("🧪 Test connection", key="sql_test"):
-        if auth == "SQL Server Authentication":
-            if not (user or "").strip():
-                st.error("❌ Chưa nhập User.")
+            instances = detect_local_instances()
+            if not instances:
+                st.error("Không tìm thấy SQL Server instance trong Registry.\n"
+                         "• Hãy cài SQL Server hoặc đảm bảo bạn có quyền đọc Registry.\n"
+                         "• Nếu dùng LocalDB, hãy khởi tạo qua `SqlLocalDB` và kết nối bằng `(localdb)\\MSSQLLocalDB`.")
                 st.stop()
-            if (pwd is None) or (str(pwd).strip() == ""):
-                st.error("❌ Chưa nhập Password.")
-                st.stop()
-        try:
-            drivers = _list_sql_odbc_drivers()
-            if drivers:
-                st.info(f"Drivers ODBC SQL Server đã cài: {', '.join(drivers)}")
-            else:
-                st.info("Chưa dò được driver hệ thống (có thể chưa cài pyodbc hoặc chưa có driver).")
-
-            msg = _try_connect_pyodbc(driver, server, port, auth, user, pwd, encrypt, trust, timeout_s=8)
-            st.success(msg)
+            for i, ins in enumerate(instances, 1):
+                st.write(f"{i}. **{ins['instance']}**  "
+                         f"(Instance ID: `{ins['instance_id']}`)  "
+                         f"→ Port: `{ins['port'] if ins['port'] else '—'}`")
         except Exception as e:
-            st.error(f"❌ Kết nối thất bại: {e}")
-
-    st.divider()
-
-    # ---- Tải danh sách DB ----
-    if st.button("🔗 Kết nối & tải danh sách DB", key="sql_listbtn"):
-        if auth == "SQL Server Authentication":
-            if not (user or "").strip():
-                st.error("❌ Chưa nhập User.")
-                st.stop()
-            if (pwd is None) or (str(pwd).strip() == ""):
-                st.error("❌ Chưa nhập Password.")
-                st.stop()
-        try:
-            # Nếu utils cần 'cnxn' thì tự mở kết nối và truyền; ngược lại truyền như cũ
-            if _sig_has_param(backup_utils.mssql_list_databases, "cnxn"):
-                import pyodbc  # đảm bảo có
-                with _open_py_cnxn(driver, server, port, auth, user, pwd, encrypt, trust, timeout_s=8) as cnxn:
-                    dbs: List[str] = backup_utils.mssql_list_databases(cnxn=cnxn) or []
-            else:
-                server_for_utils = _build_server_for_odbc(server, port)
-                dbs: List[str] = _safe_call(
-                    backup_utils.mssql_list_databases,
-                    driver=driver,
-                    server=server_for_utils,
-                    port=None,
-                    user=user,
-                    password=pwd,
-                    auth=auth,
-                    encrypt=encrypt,
-                    trust=trust,
-                ) or []
-
-            st.session_state["db_list"] = dbs
-            st.success(f"Đã tải {len(dbs)} database.")
-        except Exception as e:
-            st.error(f"Lỗi khi tải DB: {e}")
-
-    dbs = st.session_state.get("db_list", [])
-    if dbs:
-        database = st.selectbox("Chọn Database", dbs, key="sql_db")
-    else:
-        database = st.text_input("Tên Database", key="sql_dbtxt")
-
-    # ---- Tuỳ chọn backup ----
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        copy_only = st.checkbox("COPY_ONLY", value=True, key="sql_copy")
-    with c2:
-        compression = st.checkbox("COMPRESSION", value=True, key="sql_comp")
-    with c3:
-        verify = st.checkbox("VERIFYONLY", value=False, key="sql_verify")
-
-    dest_dir = st.text_input("Thư mục đích trên máy SQL Server", value="C:\\Backup", key="sql_dest")
-    bak_name = st.text_input("Tên file .bak (tùy chọn)", value="", key="sql_bak")
-
-    # ---- Backup ----
-    if st.button("📀 Backup ngay", key="sql_backupbtn"):
-        if not (database or "").strip():
-            st.error("❌ Bạn phải nhập/chọn Database")
+            st.error(f"Lỗi khi dò instance: {e}")
             st.stop()
-        if auth == "SQL Server Authentication":
-            if not (user or "").strip():
-                st.error("❌ Chưa nhập User.")
-                st.stop()
-            if (pwd is None) or (str(pwd).strip() == ""):
-                st.error("❌ Chưa nhập Password.")
-                st.stop()
-        try:
-            if _sig_has_param(backup_utils.mssql_backup_database, "cnxn"):
-                import pyodbc
-                with _open_py_cnxn(driver, server, port, auth, user, pwd, encrypt, trust, timeout_s=15, database="master") as cnxn:
-                    bak_path = backup_utils.mssql_backup_database(
-                        cnxn=cnxn,
-                        database=database.strip(),
-                        dest_path=dest_dir.strip(),
-                        backup_file=(bak_name.strip() or None),
-                        copy_only=copy_only,
-                        compression=compression,
-                        verify_only=verify,
-                    )
-            else:
-                server_for_utils = _build_server_for_odbc(server, port)
-                bak_path = _safe_call(
-                    backup_utils.mssql_backup_database,
-                    driver=driver,
-                    server=server_for_utils,
-                    user=user,
-                    password=pwd,
-                    auth=auth,
-                    database=database.strip(),
-                    dest_path=dest_dir.strip(),
-                    backup_file=(bak_name.strip() or None),
-                    copy_only=copy_only,
-                    compression=compression,
-                    verify_only=verify,
-                    encrypt=encrypt,
-                    trust=trust,
-                )
-            st.success(f"✅ Backup thành công: {bak_path}")
-            try:
-                if bak_path and os.path.exists(bak_path):
-                    with open(bak_path, "rb") as f:
-                        st.download_button("⬇️ Tải file BAK", f, file_name=os.path.basename(bak_path), key="sql_dlbak")
-            except Exception:
-                pass
-        except Exception as e:
-            st.error(f"Lỗi khi backup: {e}")
 
-# Alias
+    # --------- Chọn instance cần dùng ----------
+    ins_names = [ins["instance"] for ins in instances]
+    pick = st.selectbox("Chọn instance", ins_names, index=0, key="ins_pick")
+
+    # --------- Authentication ----------
+    colA, colB = st.columns([1, 2])
+    with colA:
+        auth = st.radio("Authentication", ["Windows Authentication", "SQL Server Authentication"], horizontal=False, key="auth_mode")
+    user = pwd = None
+    with colB:
+        if auth == "SQL Server Authentication":
+            user = st.text_input("User (ví dụ: sa)", key="auth_user")
+            pwd = st.text_input("Password", type="password", key="auth_pwd")
+
+    # --------- Kết nối & Load DB ----------
+    if st.button("🔗 Kết nối & lấy danh sách DB", type="primary"):
+        try:
+            chosen = next(x for x in instances if x["instance"] == pick)
+            server_value = _build_server_for_odbc("localhost", chosen["instance"], chosen["port"])
+            ok, note = _tcp_probe("localhost", chosen["port"])
+            st.info(note)
+            cn = open_connection(server_value, auth, user, pwd)
+            with cn:
+                dbs = list_databases(cn, include_system=False)
+            st.session_state["server_value"] = server_value
+            st.session_state["dbs"] = dbs
+            st.success(f"Đã lấy {len(dbs)} database.")
+        except StopIteration:
+            st.error("Không tìm thấy instance đã chọn.")
+        except Exception as e:
+            st.error(f"Lỗi khi kết nối/đọc DB: {e}")
+
+    dbs = st.session_state.get("dbs", [])
+    if dbs:
+        st.divider()
+        st.subheader("📀 Backup database")
+        col1, col2 = st.columns(2)
+        with col1:
+            db_pick = st.selectbox("Chọn database", dbs, key="db_pick")
+        with col2:
+            dest_dir = st.text_input("Thư mục đích trên máy SQL Server", value="C:\\Backup", key="dest_dir")
+
+        col3, col4, col5 = st.columns(3)
+        with col3:
+            copy_only = st.checkbox("COPY_ONLY", value=True)
+        with col4:
+            compression = st.checkbox("COMPRESSION", value=True)
+        with col5:
+            verify = st.checkbox("VERIFYONLY", value=False)
+
+        file_name = st.text_input("Tên file .bak (tùy chọn)", value="", key="bak_name")
+
+        if st.button("🚀 Backup ngay"):
+            try:
+                server_value = st.session_state.get("server_value")
+                if not server_value:
+                    st.error("Chưa có kết nối hợp lệ.")
+                else:
+                    cn = open_connection(server_value, auth, user, pwd)
+                    with cn:
+                        path = backup_database(
+                            cn,
+                            db=db_pick,
+                            dest_dir=dest_dir.strip(),
+                            file_name=(file_name.strip() or None),
+                            copy_only=copy_only,
+                            compression=compression,
+                            verify=verify,
+                        )
+                    st.success(f"✅ Backup thành công: {path}")
+                    try:
+                        if os.path.exists(path):
+                            with open(path, "rb") as f:
+                                st.download_button("⬇️ Tải file BAK", f, file_name=os.path.basename(path))
+                    except Exception:
+                        pass
+            except Exception as e:
+                st.error(f"Lỗi khi backup: {e}")
+
+# Alias (giữ tương thích nếu import)
 main = render
 
 if __name__ == "__main__":
