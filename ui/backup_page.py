@@ -1,9 +1,11 @@
 # ui/backup_page.py
 from __future__ import annotations
 import os
+import re
 import sys
 import socket
 import platform
+import subprocess
 import datetime as dt
 from typing import List, Optional, Tuple, Dict
 
@@ -56,10 +58,13 @@ def build_odbc_conn_str(
         f"Database={database}",
         f"Connection Timeout={int(timeout)}",
     ]
-    # Driver 18 mặc định Encrypt=Yes
-    use_encrypt = (encrypt if encrypt is not None else ("18" in driver))
-    parts.append("Encrypt=Yes" if use_encrypt else "Encrypt=No")
-    if use_encrypt and trust_server_certificate:
+    # Driver 18 mặc định Encrypt=Yes; với LocalDB/Named Pipes/Shared Memory nên tắt
+    if encrypt is None:
+        s = server_value.lower()
+        encrypt = not (s.startswith("lpc:") or s.startswith("np:") or "(localdb)" in s)
+
+    parts.append("Encrypt=Yes" if encrypt else "Encrypt=No")
+    if encrypt and trust_server_certificate:
         parts.append("TrustServerCertificate=Yes")
 
     if auth.lower().startswith("win"):
@@ -93,12 +98,17 @@ def build_server_for_odbc(host: str, instance: Optional[str], port: Optional[int
         return f"{host}\\{instance}"
     return host
 
+# ===================== TCP probe (kiểm tra cổng) ======================
+def tcp_probe(host: str, port: int, timeout: float = 0.6) -> Tuple[bool, str]:
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return True, f"TCP OK {host}:{port}"
+    except Exception as e:
+        return False, f"TCP FAIL {host}:{port} - {e}"
+
 # ===================== SSRP (SQL Server Browser) ======================
 def _ssrp_query(host: str = "127.0.0.1", timeout: float = 0.8) -> bytes | None:
-    """
-    Gửi gói 0x02 tới UDP 1434 để hỏi danh sách instance trên host.
-    Trả về bytes phản hồi (ASCII key-value;…;) hoặc None nếu không trả lời.
-    """
+    """Hỏi SQL Browser (UDP 1434) để lấy danh sách instance."""
     buf = None
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(timeout)
@@ -115,10 +125,6 @@ def _ssrp_query(host: str = "127.0.0.1", timeout: float = 0.8) -> bytes | None:
     return buf
 
 def _parse_ssrp_instances(payload: bytes) -> List[Dict[str, str]]:
-    """
-    Phân tích chuỗi phản hồi SSRP thành list instance.
-    Định dạng: 'ServerName;HOST;InstanceName;SQLEXPRESS;IsClustered;No;Version;...;tcp;1433;np;...;ServerName;HOST;InstanceName;...;'
-    """
     text = (payload or b"").decode("ascii", errors="ignore")
     tokens = [t for t in text.strip(";\x00").split(";") if t != ""]
     result: List[Dict[str, str]] = []
@@ -129,7 +135,6 @@ def _parse_ssrp_instances(payload: bytes) -> List[Dict[str, str]]:
         val = tokens[i + 1] if (i + 1) < len(tokens) else ""
         i += 2
         if key == "ServerName":
-            # Bắt đầu instance mới
             if current:
                 result.append(current)
             current = {key: val}
@@ -140,9 +145,6 @@ def _parse_ssrp_instances(payload: bytes) -> List[Dict[str, str]]:
     return result
 
 def detect_instances_ssrp_local() -> List[dict]:
-    """
-    Dò instance qua SQL Browser (UDP 1434) trên localhost. Trả về [{instance, port}, ...]
-    """
     payload = _ssrp_query("127.0.0.1", timeout=0.8)
     if not payload:
         return []
@@ -152,10 +154,8 @@ def detect_instances_ssrp_local() -> List[dict]:
         name = info.get("InstanceName") or "MSSQLSERVER"
         tcp = info.get("tcp")
         port = int(tcp) if tcp and tcp.isdigit() else None
-        items.append({"instance": name, "port": port})
-    # Ưu tiên instance mặc định
+        items.append({"source": "SSRP", "instance": name, "port": port})
     items.sort(key=lambda x: (x["instance"] != "MSSQLSERVER", x["instance"]))
-    # Loại trùng
     dedup: Dict[str, dict] = {}
     for it in items:
         dedup.setdefault(it["instance"], it)
@@ -163,9 +163,6 @@ def detect_instances_ssrp_local() -> List[dict]:
 
 # =================== Windows Registry (nếu khả dụng) ===================
 def detect_instances_registry() -> List[dict]:
-    """
-    Trả về danh sách instance từ Registry (chỉ Windows). [{instance, port}, ...]
-    """
     if platform.system() != "Windows":
         return []
     try:
@@ -199,6 +196,23 @@ def detect_instances_registry() -> List[dict]:
         winreg.CloseKey(key)
         return results
 
+    def enum_subkeys(root, path: str) -> List[str]:
+        keys = []
+        try:
+            key = winreg.OpenKey(root, path)
+        except Exception:
+            return keys
+        i = 0
+        while True:
+            try:
+                sub = winreg.EnumKey(key, i)
+                keys.append(sub)
+                i += 1
+            except OSError:
+                break
+        winreg.CloseKey(key)
+        return keys
+
     ROOT = winreg.HKEY_LOCAL_MACHINE
     paths = [
         r"SOFTWARE\Microsoft\Microsoft SQL Server\Instance Names\SQL",
@@ -211,66 +225,195 @@ def detect_instances_registry() -> List[dict]:
 
     items: List[dict] = []
     for inst_name, inst_id in name_to_id.items():
-        ipall = rf"SOFTWARE\Microsoft\Microsoft SQL Server\{inst_id}\MSSQLServer\SuperSocketNetLib\Tcp\IPAll"
-        ipall_wow = rf"SOFTWARE\WOW6432Node\Microsoft\Microsoft SQL Server\{inst_id}\MSSQLServer\SuperSocketNetLib\Tcp\IPAll"
-        tcp_port = read_value(ROOT, ipall, "TcpPort") or read_value(ROOT, ipall_wow, "TcpPort")
-        tcp_dyn = read_value(ROOT, ipall, "TcpDynamicPorts") or read_value(ROOT, ipall_wow, "TcpDynamicPorts")
+        tcp_root = rf"SOFTWARE\Microsoft\Microsoft SQL Server\{inst_id}\MSSQLServer\SuperSocketNetLib\Tcp"
+        tcp_root_wow = rf"SOFTWARE\WOW6432Node\Microsoft\Microsoft SQL Server\{inst_id}\MSSQLServer\SuperSocketNetLib\Tcp"
+
+        # Ưu tiên IPAll
+        tcp_port = (
+            read_value(ROOT, tcp_root + r"\IPAll", "TcpPort")
+            or read_value(ROOT, tcp_root_wow + r"\IPAll", "TcpPort")
+        )
+        tcp_dyn = (
+            read_value(ROOT, tcp_root + r"\IPAll", "TcpDynamicPorts")
+            or read_value(ROOT, tcp_root_wow + r"\IPAll", "TcpDynamicPorts")
+        )
         port: Optional[int] = None
         if tcp_port and tcp_port.strip().isdigit():
             port = int(tcp_port.strip())
         elif tcp_dyn:
             for token in filter(None, [x.strip() for x in tcp_dyn.split(",")]):
-                if token.isdigit():
+                if token.isdigit() and token != "0":
                     port = int(token)
                     break
-        items.append({"instance": inst_name, "port": port})
+
+        # Nếu IPAll không có, quét từng IPn
+        if port is None:
+            for base in (tcp_root, tcp_root_wow):
+                for sub in enum_subkeys(ROOT, base):
+                    if not sub.upper().startswith("IP"):
+                        continue
+                    en = read_value(ROOT, rf"{base}\{sub}", "Enabled")
+                    if en and en.strip().isdigit() and int(en) == 1:
+                        p1 = read_value(ROOT, rf"{base}\{sub}", "TcpPort")
+                        p2 = read_value(ROOT, rf"{base}\{sub}", "TcpDynamicPorts")
+                        if p1 and p1.strip().isdigit():
+                            port = int(p1.strip())
+                            break
+                        if p2:
+                            for token in filter(None, [x.strip() for x in p2.split(",")]):
+                                if token.isdigit() and token != "0":
+                                    port = int(token)
+                                    break
+                    if port is not None:
+                        break
+                if port is not None:
+                    break
+
+        items.append({"source": "Registry", "instance": inst_name, "port": port})
     items.sort(key=lambda x: (x["instance"] != "MSSQLSERVER", x["instance"]))
     return items
+
+# ================= Windows Services (không cần quyền admin) ============
+def detect_instances_services_windows() -> List[dict]:
+    if platform.system() != "Windows":
+        return []
+    try:
+        # Dò qua sc.exe để lấy danh sách dịch vụ
+        cp = subprocess.run(["sc", "query", "type=", "service", "state=", "all"], capture_output=True)
+        text = cp.stdout.decode(errors="ignore")
+    except Exception:
+        return []
+    names = re.findall(r"SERVICE_NAME:\s*(\S+)", text, flags=re.IGNORECASE)
+    items: List[dict] = []
+    for n in names:
+        if n.upper() == "MSSQLSERVER":
+            items.append({"source": "Service", "instance": "MSSQLSERVER", "port": None})
+        elif n.upper().startswith("MSSQL$"):
+            inst = n.split("$", 1)[1]
+            items.append({"source": "Service", "instance": inst, "port": None})
+    # Loại trùng
+    dedup: Dict[str, dict] = {}
+    for it in items:
+        dedup.setdefault(it["instance"], it)
+    items = list(dedup.values())
+    items.sort(key=lambda x: (x["instance"] != "MSSQLSERVER", x["instance"]))
+    return items
+
+# ====================== LocalDB (nếu có SqlLocalDB) ====================
+def detect_instances_localdb() -> List[dict]:
+    try:
+        cp = subprocess.run(["SqlLocalDB", "info"], capture_output=True)
+        if cp.returncode != 0:
+            return []
+        text = cp.stdout.decode(errors="ignore")
+        names = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("LocalDB")]
+        items = []
+        for nm in names:
+            items.append({"source": "LocalDB", "instance": nm, "port": None})
+        return items
+    except Exception:
+        return []
 
 # ====================== Tổng hợp phát hiện instance ======================
 def detect_local_instances() -> List[dict]:
     """
-    Gộp Registry (nếu có) + SSRP (UDP 1434) rồi loại trùng.
-    Nếu vẫn không có, thử default localhost:1433 nếu port mở.
+    Gộp Registry (Windows) + SSRP (UDP 1434) + Services (Windows) + LocalDB rồi loại trùng.
+    Nếu vẫn rỗng, thử default localhost:1433 nếu cổng mở.
     """
     merged: Dict[str, dict] = {}
+
     for it in detect_instances_registry():
         merged[it["instance"]] = it
     for it in detect_instances_ssrp_local():
         merged.setdefault(it["instance"], it)
+        # Nếu SSRP cung cấp port thì cập nhật
+        if it.get("port") and merged[it["instance"]].get("port") is None:
+            merged[it["instance"]]["port"] = it["port"]
+    for it in detect_instances_services_windows():
+        merged.setdefault(it["instance"], it)
+    for it in detect_instances_localdb():
+        merged.setdefault(it["instance"], it)
 
     items = list(merged.values())
+    # Fallback: nếu không có gì và 1433 mở, coi như default
     if not items:
-        # Fallback: thử 1433
         ok, _ = tcp_probe("127.0.0.1", 1433, timeout=0.6)
         if ok:
-            items = [{"instance": "MSSQLSERVER", "port": 1433}]
+            items = [{"source": "Fallback", "instance": "MSSQLSERVER", "port": 1433}]
+
     items.sort(key=lambda x: (x["instance"] != "MSSQLSERVER", x["instance"]))
     return items
 
-def tcp_probe(host: str, port: int, timeout: float = 0.6) -> Tuple[bool, str]:
-    try:
-        with socket.create_connection((host, int(port)), timeout=timeout):
-            return True, f"TCP OK {host}:{port}"
-    except Exception as e:
-        return False, f"TCP FAIL {host}:{port} - {e}"
+# ============================ Kết nối đa chế độ ===========================
+def server_variants_for_instance(instance: str, port: Optional[int]) -> List[str]:
+    """
+    Trả về nhiều biến thể server để thử:
+      - TCP (nếu có port): 127.0.0.1,PORT và localhost,PORT
+      - Shared Memory (lpc:) cho local
+      - Named Pipe (np:) cho default/named
+      - HOST\INSTANCE (cần SQL Browser nếu không có port)
+      - LocalDB: (localdb)\NAME
+    """
+    v: List[str] = []
+    if instance.lower().startswith("(localdb)"):
+        # (localdb)\MSSQLLocalDB
+        v.append(instance)  # giữ nguyên
+        return v
+
+    # TCP khi có port
+    if port:
+        v.append(f"127.0.0.1,{port}")
+        v.append(f"localhost,{port}")
+
+    # Shared Memory (local only)
+    if instance.upper() == "MSSQLSERVER":
+        v.append("lpc:.")
+        v.append("np:\\\\.\\pipe\\sql\\query")
+        v.append("localhost")
+        v.append(".")
+    else:
+        v.append(f"lpc:localhost\\{instance}")
+        v.append(f"np:\\\\.\\pipe\\MSSQL${instance}\\sql\\query")
+        v.append(f"localhost\\{instance}")
+        v.append(f".\\{instance}")
+
+    return v
+
+def try_open_connection(
+    instance: str,
+    port: Optional[int],
+    auth_mode: str,
+    user: Optional[str],
+    pwd: Optional[str],
+    timeout: int = 8,
+) -> Tuple[pyodbc.Connection, str]:
+    """
+    Thử lần lượt các biến thể server cho tới khi kết nối được.
+    Trả về (connection, server_value_đã_dùng).
+    """
+    driver = pick_sql_odbc_driver()
+    last_err = None
+    for server_value in server_variants_for_instance(instance, port):
+        try:
+            conn_str = build_odbc_conn_str(
+                driver=driver,
+                server_value=server_value,
+                database="master",
+                auth=("windows" if auth_mode == "Windows Authentication" else "sql"),
+                user=user,
+                password=pwd,
+                encrypt=None,  # auto; sẽ tắt nếu lpc:/np:/localdb
+                trust_server_certificate=True,
+                timeout=timeout,
+            )
+            cn = pyodbc.connect(conn_str, timeout=timeout)
+            return cn, server_value
+        except Exception as e:
+            last_err = f"{server_value} -> {e}"
+            continue
+    raise RuntimeError(last_err or "Không thể mở kết nối với bất kỳ biến thể server nào.")
 
 # ============================ DB operations ============================
-def open_connection(server_value: str, auth_mode: str, user: Optional[str], pwd: Optional[str]) -> pyodbc.Connection:
-    driver = pick_sql_odbc_driver()
-    conn_str = build_odbc_conn_str(
-        driver=driver,
-        server_value=server_value,
-        database="master",
-        auth=("windows" if auth_mode == "Windows Authentication" else "sql"),
-        user=user,
-        password=pwd,
-        encrypt=None,  # auto
-        trust_server_certificate=True,
-        timeout=8,
-    )
-    return pyodbc.connect(conn_str, timeout=8)
-
 def list_databases(cnxn: pyodbc.Connection, include_system: bool = False) -> List[str]:
     sql = "SELECT name FROM sys.databases"
     if not include_system:
@@ -312,22 +455,23 @@ def backup_database(
 
 # ================================ UI =================================
 def render():
-    st.title("SQL Server — Auto Detect (Cross-Platform) & Backup")
+    st.title("SQL Server — Auto Detect & Backup (Enhanced)")
 
     # --------- Phát hiện instance cục bộ ----------
-    with st.expander("🔎 Instances phát hiện trên máy (Registry & SSRP)", expanded=True):
+    with st.expander("🔎 Instances phát hiện trên máy (Registry / SSRP / Services / LocalDB)", expanded=True):
         try:
             items = detect_local_instances()
             if not items:
                 st.error(
                     "Không phát hiện được instance cục bộ.\n"
-                    "• Hãy đảm bảo SQL Server đã cài & đang chạy.\n"
-                    "• Nếu là named instance, bật dịch vụ **SQL Server Browser** (UDP 1434).\n"
-                    "• Hoặc mở port TCP (thường 1433) để công cụ dò."
+                    "• Đảm bảo SQL Server đã cài & đang chạy.\n"
+                    "• Với named instance không đặt port tĩnh, hãy bật dịch vụ **SQL Server Browser** (UDP 1434).\n"
+                    "• Hoặc đặt **TCP Port tĩnh** trong SQL Server Configuration Manager."
                 )
                 st.stop()
             for i, it in enumerate(items, 1):
-                st.write(f"{i}. **{it['instance']}** → Port: `{it['port'] if it['port'] else '—'}`")
+                src = it.get("source", "?")
+                st.write(f"{i}. **{it['instance']}**  (nguồn: {src})  → Port: `{it['port'] if it['port'] else '—'}`")
         except Exception as e:
             st.error(f"Lỗi khi dò instance: {e}")
             st.stop()
@@ -339,7 +483,8 @@ def render():
     colA, colB = st.columns([1, 2])
     with colA:
         default_auth = "Windows Authentication" if platform.system() == "Windows" else "SQL Server Authentication"
-        auth = st.radio("Authentication", ["Windows Authentication", "SQL Server Authentication"], index=0 if default_auth.startswith("Windows") else 1, key="auth_mode")
+        auth = st.radio("Authentication", ["Windows Authentication", "SQL Server Authentication"],
+                        index=0 if default_auth.startswith("Windows") else 1, key="auth_mode")
     user = pwd = None
     with colB:
         if auth == "SQL Server Authentication":
@@ -350,21 +495,24 @@ def render():
     if st.button("🔗 Kết nối & lấy danh sách DB", type="primary"):
         try:
             chosen = next(x for x in items if x["instance"] == pick)
-            host = "localhost"
-            server_value = build_server_for_odbc(host, chosen["instance"], chosen["port"])
-            # Info TCP nếu biết port
-            if chosen["port"]:
-                ok, note = tcp_probe(normalize_host_for_port(server_value), chosen["port"])
+            instance = chosen["instance"]
+            port = chosen.get("port")
+
+            # Thông tin TCP nếu có
+            if port:
+                ok, note = tcp_probe("127.0.0.1", port, timeout=0.8)
                 st.info(note)
-            cn = open_connection(server_value, auth, user, pwd)
+
+            cn, used_server = try_open_connection(instance, port, auth, user, pwd, timeout=8)
             with cn:
                 dbs = list_databases(cn, include_system=False)
-            st.session_state["server_value"] = server_value
+
+            st.session_state["used_server"] = used_server
             st.session_state["auth"] = auth
             st.session_state["user"] = user
             st.session_state["pwd"] = pwd
             st.session_state["dbs"] = dbs
-            st.success(f"Đã lấy {len(dbs)} database.")
+            st.success(f"Đã kết nối bằng: `{used_server}` — Lấy được {len(dbs)} database.")
         except StopIteration:
             st.error("Không tìm thấy instance đã chọn.")
         except Exception as e:
@@ -398,14 +546,27 @@ def render():
 
     if st.button("🚀 Backup ngay"):
         try:
-            server_value = st.session_state.get("server_value")
+            used_server = st.session_state.get("used_server")
             auth = st.session_state.get("auth")
             user = st.session_state.get("user")
             pwd = st.session_state.get("pwd")
-            if not server_value:
+            if not used_server:
                 st.error("Chưa có kết nối hợp lệ.")
                 st.stop()
-            cn = open_connection(server_value, auth, user, pwd)
+
+            driver = pick_sql_odbc_driver()
+            conn_str = build_odbc_conn_str(
+                driver=driver,
+                server_value=used_server,
+                database="master",
+                auth=("windows" if auth == "Windows Authentication" else "sql"),
+                user=user,
+                password=pwd,
+                encrypt=None,
+                trust_server_certificate=True,
+                timeout=12,
+            )
+            cn = pyodbc.connect(conn_str, timeout=12)
             with cn:
                 path = backup_database(
                     cn,
@@ -417,7 +578,6 @@ def render():
                     verify=verify,
                 )
             st.success(f"✅ Backup thành công: {path}")
-            # Lưu ý: file do SQL Server ghi; nếu SQL ở máy khác, nút tải dưới đây có thể không đọc được.
             try:
                 if os.path.exists(path):
                     with open(path, "rb") as f:
