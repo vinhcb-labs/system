@@ -85,7 +85,7 @@ def normalize_host_for_port(server: str) -> str:
     return server
 
 def build_server_for_odbc(host: str, instance: Optional[str], port: Optional[int]) -> str:
-    """
+    r"""
     - Có port -> 'HOST,PORT' (ổn định, không cần SQL Browser)
     - Không có port:
         + Instance mặc định -> 'HOST'
@@ -163,6 +163,7 @@ def detect_instances_ssrp_local() -> List[dict]:
 
 # =================== Windows Registry (nếu khả dụng) ===================
 def detect_instances_registry() -> List[dict]:
+    """Trả về danh sách instance từ Registry (chỉ Windows)."""
     if platform.system() != "Windows":
         return []
     try:
@@ -228,7 +229,6 @@ def detect_instances_registry() -> List[dict]:
         tcp_root = rf"SOFTWARE\Microsoft\Microsoft SQL Server\{inst_id}\MSSQLServer\SuperSocketNetLib\Tcp"
         tcp_root_wow = rf"SOFTWARE\WOW6432Node\Microsoft\Microsoft SQL Server\{inst_id}\MSSQLServer\SuperSocketNetLib\Tcp"
 
-        # Ưu tiên IPAll
         tcp_port = (
             read_value(ROOT, tcp_root + r"\IPAll", "TcpPort")
             or read_value(ROOT, tcp_root_wow + r"\IPAll", "TcpPort")
@@ -275,6 +275,7 @@ def detect_instances_registry() -> List[dict]:
 
 # ================= Windows Services (không cần quyền admin) ============
 def detect_instances_services_windows() -> List[dict]:
+    """Dò instance qua tên dịch vụ Windows (MSSQLSERVER, MSSQL$<name>)."""
     if platform.system() != "Windows":
         return []
     try:
@@ -301,6 +302,7 @@ def detect_instances_services_windows() -> List[dict]:
 
 # ====================== LocalDB (nếu có SqlLocalDB) ====================
 def detect_instances_localdb() -> List[dict]:
+    """Dò LocalDB qua lệnh `SqlLocalDB info` nếu khả dụng."""
     try:
         cp = subprocess.run(["SqlLocalDB", "info"], capture_output=True)
         if cp.returncode != 0:
@@ -309,7 +311,7 @@ def detect_instances_localdb() -> List[dict]:
         names = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("LocalDB")]
         items = []
         for nm in names:
-            items.append({"source": "LocalDB", "instance": nm, "port": None})
+            items.append({"source": "LocalDB", "instance": f"(localdb)\\{nm}", "port": None})
         return items
     except Exception:
         return []
@@ -326,7 +328,6 @@ def detect_local_instances() -> List[dict]:
         merged[it["instance"]] = it
     for it in detect_instances_ssrp_local():
         merged.setdefault(it["instance"], it)
-        # Nếu SSRP cung cấp port thì cập nhật
         if it.get("port") and merged[it["instance"]].get("port") is None:
             merged[it["instance"]]["port"] = it["port"]
     for it in detect_instances_services_windows():
@@ -335,7 +336,6 @@ def detect_local_instances() -> List[dict]:
         merged.setdefault(it["instance"], it)
 
     items = list(merged.values())
-    # Fallback: nếu không có gì và 1433 mở, coi như default
     if not items:
         ok, _ = tcp_probe("127.0.0.1", 1433, timeout=0.6)
         if ok:
@@ -346,17 +346,18 @@ def detect_local_instances() -> List[dict]:
 
 # ============================ Kết nối đa chế độ ===========================
 def server_variants_for_instance(instance: str, port: Optional[int]) -> List[str]:
-    """
+    r"""
     Trả về nhiều biến thể server để thử:
       - TCP (nếu có port): 127.0.0.1,PORT và localhost,PORT
       - Shared Memory (lpc:) cho local
       - Named Pipe (np:) cho default/named
-      - HOST\INSTANCE (cần SQL Browser nếu không có port)
-      - LocalDB: (localdb)\NAME
+      - HOST\\INSTANCE (cần SQL Browser nếu không có port)
+      - LocalDB: (localdb)\\NAME
     """
     v: List[str] = []
-    if instance.lower().startswith("(localdb)"):
-        # (localdb)\MSSQLLocalDB
+    low = instance.lower()
+    if low.startswith("(localdb)"):
+        # ví dụ: (localdb)\MSSQLLocalDB
         v.append(instance)  # giữ nguyên
         return v
 
@@ -368,12 +369,12 @@ def server_variants_for_instance(instance: str, port: Optional[int]) -> List[str
     # Shared Memory (local only)
     if instance.upper() == "MSSQLSERVER":
         v.append("lpc:.")
-        v.append("np:\\\\.\\pipe\\sql\\query")
+        v.append(r"np:\\.\pipe\sql\query")
         v.append("localhost")
         v.append(".")
     else:
         v.append(f"lpc:localhost\\{instance}")
-        v.append(f"np:\\\\.\\pipe\\MSSQL${instance}\\sql\\query")
+        v.append(rf"np:\\.\pipe\MSSQL${instance}\sql\query")
         v.append(f"localhost\\{instance}")
         v.append(f".\\{instance}")
 
