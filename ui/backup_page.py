@@ -27,40 +27,105 @@ def _safe_call(func: Callable, **kwargs) -> Any:
             if name in ("backup_file", "filename"): mapped[name] = kwargs.get("backup_file") or kwargs.get("filename")
     return func(**mapped)
 
+def _normalize_host_for_port(server: str) -> str:
+    """
+    Nếu server có dạng 'HOST\\INSTANCE' và có Port thì chỉ lấy 'HOST'.
+    """
+    server = (server or "").strip()
+    if "\\" in server:
+        host, _instance = server.split("\\", 1)
+        return host.strip()
+    return server
+
 def _build_server_for_odbc(server: str, port: Optional[str]) -> str:
     """
-    Nếu có port -> trả về 'SERVER,PORT' (kể cả khi server chứa '\\INSTANCE').
-    Nếu không port -> trả về 'SERVER' nguyên gốc (trường hợp này sẽ phụ thuộc SQL Browser khi xài INSTANCE).
+    - Nếu có port -> trả về 'HOST,PORT' (tự loại bỏ '\INSTANCE' nếu có).
+    - Nếu không port -> trả về 'SERVER' nguyên gốc (có thể là 'HOST' hoặc 'HOST\\INSTANCE').
     """
-
     server = (server or "").strip()
     port = (port or "").strip()
     if port:
-        return f"{server},{port}"
+        host = _normalize_host_for_port(server)
+        return f"{host},{int(port)}"
     return server
+
+def build_connection_string(
+    driver: str,
+    server_input: str,
+    port: str | int | None = None,
+    database: str | None = "master",
+    auth_mode: str = "sql",          # "sql" | "windows"
+    user: str | None = None,
+    password: str | None = None,
+    encrypt: bool | None = None,     # None = tự động theo driver
+    trust_server_certificate: bool = True,
+    timeout: int = 8,
+    application_intent: str | None = None,  # e.g. "ReadOnly"
+) -> str:
+    """
+    Trả về pyodbc connection string cho SQL Server (ODBC 17/18).
+    - Nếu có port -> luôn dùng HOST,PORT (không phụ thuộc SQL Browser).
+    - Nếu không có port nhưng có INSTANCE -> dùng HOST\\INSTANCE (cần SQL Browser UDP 1434).
+    """
+    drv_raw = (driver or "").strip()
+    if "18" in drv_raw:
+        drv = "{ODBC Driver 18 for SQL Server}"
+        default_encrypt = True
+    else:
+        drv = "{ODBC Driver 17 for SQL Server}"
+        default_encrypt = False
+
+    # Ghép server đúng quy tắc
+    server_value = _build_server_for_odbc(server_input, str(port) if port is not None and str(port).strip() else None)
+
+    parts = [
+        f"Driver={drv}",
+        f"Server={server_value}",
+        f"Connection Timeout={int(timeout)}",
+    ]
+    if database:
+        parts.append(f"Database={database}")
+
+    use_encrypt = default_encrypt if encrypt is None else bool(encrypt)
+    if use_encrypt:
+        parts.append("Encrypt=yes")
+        if trust_server_certificate:
+            parts.append("TrustServerCertificate=yes")
+    else:
+        parts.append("Encrypt=no")
+
+    if application_intent:
+        parts.append(f"Application Intent={application_intent}")
+
+    if auth_mode.lower().startswith("win"):
+        parts.append("Trusted_Connection=yes")
+    else:
+        if not user:
+            raise ValueError("auth_mode='sql' yêu cầu user.")
+        if password is None:
+            raise ValueError("auth_mode='sql' yêu cầu password.")
+        parts.append(f"UID={user}")
+        parts.append(f"PWD={password}")
+
+    return ";".join(parts) + ";"
 
 def _try_connect_pyodbc(driver: str, server: str, port: Optional[str],
                         auth: str, user: str, pwd: str,
                         encrypt: bool, trust: bool, timeout_s: int = 8) -> str:
     """Thử kết nối nhanh để bắt lỗi HYT00 ngay trong UI (không đụng logic utils)."""
     import pyodbc
-    server_full = _build_server_for_odbc(server, port)
-    parts = [
-        f"DRIVER={{{driver}}}".format(driver=driver),
-        f"SERVER={server_full}",
-        "DATABASE=master",
-        f"Connection Timeout={timeout_s}",
-    ]
-    if encrypt: parts.append("Encrypt=Yes")
-    if trust:   parts.append("TrustServerCertificate=Yes")
-
-    if auth == "Windows Authentication":
-        parts.append("Trusted_Connection=Yes")
-    else:
-        parts.append(f"UID={user}")
-        parts.append(f"PWD={pwd}")
-
-    conn_str = ";".join(parts) + ";"
+    conn_str = build_connection_string(
+        driver=driver,
+        server_input=server,
+        port=(port.strip() if isinstance(port, str) else port),
+        database="master",
+        auth_mode=("windows" if auth == "Windows Authentication" else "sql"),
+        user=(user or None),
+        password=(pwd or None),
+        encrypt=encrypt,
+        trust_server_certificate=trust,
+        timeout=timeout_s,
+    )
     with pyodbc.connect(conn_str, timeout=timeout_s) as cn:
         return f"OK. Server name: {cn.getinfo(pyodbc.SQL_SERVER_NAME)}"
 
@@ -141,7 +206,8 @@ def backup_sql_tab() -> None:
 
     ecol, tcol = st.columns(2)
     with ecol:
-        encrypt = st.checkbox("Encrypt", value=True, key="sql_encrypt")
+        # Với Driver 18, Encrypt nên bật. Vẫn cho phép tắt nếu cần.
+        encrypt = st.checkbox("Encrypt", value=("18" in driver), key="sql_encrypt")
     with tcol:
         trust = st.checkbox("Trust server certificate", value=True, key="sql_trust")
 
@@ -164,11 +230,13 @@ def backup_sql_tab() -> None:
     # ---- Tải danh sách DB ----
     if st.button("🔗 Kết nối & tải danh sách DB", key="sql_listbtn"):
         try:
+            # server đã được chuẩn hoá về HOST,PORT nếu có port
+            server_for_utils = _build_server_for_odbc(server, port)
             dbs: List[str] = _safe_call(
                 backup_utils.mssql_list_databases,
                 driver=driver,
-                server=_build_server_for_odbc(server, port),
-                port=None,  # nếu utils không cần port riêng khi đã ghép, để None
+                server=server_for_utils,
+                port=None,  # utils không cần port riêng khi đã ghép
                 user=user,
                 password=pwd,
                 auth=auth,
@@ -204,10 +272,11 @@ def backup_sql_tab() -> None:
             st.error("❌ Bạn phải nhập/chọn Database")
             return
         try:
+            server_for_utils = _build_server_for_odbc(server, port)
             bak_path = _safe_call(
                 backup_utils.mssql_backup_database,
                 driver=driver,
-                server=_build_server_for_odbc(server, port),
+                server=server_for_utils,
                 user=user,
                 password=pwd,
                 auth=auth,
